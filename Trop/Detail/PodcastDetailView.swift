@@ -8,6 +8,26 @@
 @preconcurrency import SwiftyTube
 import SwiftUI
 
+/// One policy for episode row art, queued playback, menus and downloads.
+/// A genuine episode image wins; otherwise show the podcast cover.
+private enum PodcastEpisodeArtwork {
+    static func url(episode: String?, show: String?) -> String? {
+        if let episode, !episode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return episode
+        }
+        if let show, !show.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return show
+        }
+        return nil
+    }
+
+    static func song(_ episode: EpisodeItem, show: String?) -> SongItem {
+        var song = episode.toSongItem()
+        song.thumbnailUrl = url(episode: song.thumbnailUrl, show: show)
+        return song
+    }
+}
+
 // MARK: - View Model
 
 @MainActor
@@ -49,7 +69,9 @@ final class PodcastDetailViewModel {
             )
             if SettingsStore.shared.autoDownloadNewEpisodes, !fresh.isEmpty {
                 for episode in fresh.prefix(10) {
-                    await DownloadManager.shared.download(song: episode.toSongItem())
+                    await DownloadManager.shared.download(
+                        song: PodcastEpisodeArtwork.song(episode, show: parsed.thumbnailUrl)
+                    )
                 }
             }
         } catch {
@@ -559,6 +581,7 @@ struct PodcastDetailView: View {
         ForEach(Array(podcast.episodes.enumerated()), id: \.element.videoId) { index, episode in
             EpisodeRowView(
                 episode: episode,
+                showArtworkURL: podcast.thumbnailUrl,
                 onTap: { playEpisode(episode, in: podcast) },
                 onNavigate: { pendingRoute = $0 }
             )
@@ -577,15 +600,10 @@ struct PodcastDetailView: View {
         PlaybackQueue.play(podcastSongs(podcast), log: Log.podcastDetail, context: "playAll")
     }
 
-    /// Episodes inherit the podcast's cover so the player shows the show
-    /// profile image for every episode.
+    /// Preserve distinct episode art; fall back to the show cover consistently.
     private func podcastSongs(_ podcast: PodcastDetailInfo) -> [SongItem] {
-        podcast.episodes.map { episode in
-            var song = episode.toSongItem()
-            if let cover = podcast.thumbnailUrl, !cover.isEmpty {
-                song.thumbnailUrl = cover
-            }
-            return song
+        podcast.episodes.map {
+            PodcastEpisodeArtwork.song($0, show: podcast.thumbnailUrl)
         }
     }
 
@@ -677,19 +695,17 @@ struct PodcastMoreSheet: View {
 
     private func addToQueue() {
         let np = NowPlaying.shared
-        let songs = podcast.episodes.map { episode in
-            var song = episode.toSongItem()
-            if let cover = podcast.thumbnailUrl, !cover.isEmpty {
-                song.thumbnailUrl = cover
-            }
-            return song
+        let songs = podcast.episodes.map {
+            PodcastEpisodeArtwork.song($0, show: podcast.thumbnailUrl)
         }
         np.queueSongs.append(contentsOf: songs)
         np.persistQueueState()
     }
 
     private func downloadAll() {
-        let songs = podcast.episodes.map { $0.toSongItem() }
+        let songs = podcast.episodes.map {
+            PodcastEpisodeArtwork.song($0, show: podcast.thumbnailUrl)
+        }
         Task { await DownloadManager.shared.downloadAll(songs) }
     }
 
@@ -757,6 +773,7 @@ private struct ExpandableDescriptionText: View {
 
 private struct EpisodeRowView: View {
     let episode: EpisodeItem
+    let showArtworkURL: String?
     var onTap: () -> Void
     var onNavigate: ((DetailRoute) -> Void)?
 
@@ -768,7 +785,9 @@ private struct EpisodeRowView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top, spacing: 12) {
-                AsyncImageView(url: episode.thumbnailUrl)
+                AsyncImageView(url: PodcastEpisodeArtwork.url(
+                    episode: episode.thumbnailUrl, show: showArtworkURL
+                ))
                     .frame(width: 72, height: 72)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .onTapGesture(perform: onTap)
@@ -832,7 +851,7 @@ private struct EpisodeRowView: View {
         }
         .sheet(isPresented: $showMenu) {
             SongMenuSheet(
-                song: episode.toSongItem(),
+                song: PodcastEpisodeArtwork.song(episode, show: showArtworkURL),
                 onNavigate: { onNavigate?($0) }
             )
         }

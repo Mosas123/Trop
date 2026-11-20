@@ -26,6 +26,24 @@ struct StudioAudioMatchChecks {
         )
     }
 
+    private static func sourceVerified(
+        title: String = "Moscow Mule",
+        artist: String = "Bad Bunny",
+        album: String? = "Un Verano Sin Ti",
+        duration: Int? = 245,
+        candidateTitle: String = "Moscow Mule",
+        candidateArtist: String? = "Bad Bunny",
+        candidateAlbum: String? = "Un Verano Sin Ti",
+        candidateDuration: Int? = 245
+    ) -> Bool {
+        TextMatch.verifiedAudioSource(
+            wantedTitle: title, wantedArtist: artist,
+            wantedAlbum: album, wantedDuration: duration,
+            candidateTitle: candidateTitle, candidateArtist: candidateArtist,
+            candidateAlbum: candidateAlbum, candidateDuration: candidateDuration
+        )
+    }
+
     static func main() {
         precondition(MusicRecordingSelectionPolicy.isMusicVideo(
             isVideo: nil, type: "MUSIC_VIDEO_TYPE_OMV"
@@ -129,6 +147,84 @@ struct StudioAudioMatchChecks {
             candidateAlbum: "Different Album", candidateDuration: 183,
             originalWasVideo: true
         ), "Even video intro allowance must reject a different album")
+        // Hard gate used by BOTH add-on search/album cache and JioSaavn.
+        precondition(sourceVerified(), "Verified exact original must remain playable")
+        precondition(sourceVerified(candidateTitle: "Moscow Mule (Official Audio)"),
+                     "Official audio is a presentation label, not another recording")
+        precondition(sourceVerified(candidateArtist: "Bad Bunny - Topic"),
+                     "Canonical Topic channel is the same primary artist")
+        precondition(sourceVerified(candidateArtist: "Bad Bunny, Mora"),
+                     "Featured artists may follow the same primary performer")
+        precondition(!sourceVerified(candidateTitle: "Moscow Mule (Remix)"),
+                     "Remix cannot replace the original even in FLAC")
+        precondition(!sourceVerified(candidateTitle: "Moscow Mule (Instrumental)"),
+                     "Vocal recording cannot become instrumental")
+        precondition(!sourceVerified(candidateTitle: "Moscow Mule (Radio Edit)"),
+                     "Radio edit is a different source recording")
+        precondition(!sourceVerified(candidateTitle: "Moscow Mule (Extended Mix)"),
+                     "Extended mix must not leak into original")
+        precondition(!sourceVerified(candidateArtist: "Bad Bunny Tribute"),
+                     "Tribute performers cannot inherit metadata")
+        precondition(!sourceVerified(candidateArtist: "Drake"),
+                     "Same title by a different performer is not a match")
+        precondition(!sourceVerified(candidateArtist: nil),
+                     "Missing provider credits are not confirmation")
+        precondition(!sourceVerified(artist: ""),
+                     "Missing requested artist must not trigger cross-source playback")
+        precondition(!sourceVerified(candidateAlbum: "Other Release"),
+                     "An incompatible known release is disallowed")
+        precondition(!sourceVerified(candidateDuration: 280),
+                     "A materially different length must be rejected")
+        precondition(!sourceVerified(album: nil, candidateAlbum: nil,
+                                     candidateDuration: nil),
+                     "Without album and duration there is no independent verification")
+        precondition(!sourceVerified(candidateAlbum: nil,
+                                     candidateDuration: nil),
+                     "An empty candidate release cannot replace a missing duration")
+        precondition(sourceVerified(candidateDuration: nil),
+                     "An exact shared album can verify a missing duration")
+        precondition(!sourceVerified(album: "Deluxe Edition",
+                                     candidateAlbum: "Standard Edition",
+                                     candidateDuration: nil),
+                     "Missing time cannot hide a mismatched edition")
+
+        // Large negative fixture matrix: every unsafe title and artist is
+        // rejected even if the provider advertises a superior quality tier.
+        let wrongVersions = [
+            "(Remix)", "(Instrumental)", "(Karaoke)", "(Live)",
+            "(Acoustic)", "(Demo)", "(Cover)", "(Slowed)",
+            "(Nightcore)", "(Clean)", "(Explicit)", "(Extended Mix)",
+            "(Radio Edit)", "(Club Mix)", "(Bootleg)", "(Mashup)",
+            "(Medley)", "(Rework)", "(Remastered 2016)", "(Sped Up)",
+            "(A Cappella)", "(Reverb)", "(Tribute)",
+            "- Live", "- Radio Edit", "- Original Mix",
+            "- Single Version", "- Album Version", "(En Vivo)"
+        ]
+        let wrongArtists = [
+            "Bad Bunny Tribute", "Bad Bunny Covers", "Drake",
+            "Bunny Bad", "Bad Bunny Bell", "Mora", "Sech",
+            "Bad Bunny Tribute Band"
+        ]
+        var negativeCases = 0
+        for version in wrongVersions {
+            let variant = "Moscow Mule " + version
+            for candidateArtist in ["Bad Bunny", "Drake", "Bad Bunny Tribute"] {
+                precondition(!sourceVerified(candidateTitle: variant,
+                                             candidateArtist: candidateArtist),
+                             "Rejected source version: \(variant) / \(candidateArtist)")
+                negativeCases += 1
+            }
+        }
+        for wrongArtist in wrongArtists {
+            for duration in [243, 245, 247] {
+                precondition(!sourceVerified(candidateArtist: wrongArtist,
+                                             candidateDuration: duration),
+                             "Rejected wrong performer: \(wrongArtist)")
+                negativeCases += 1
+            }
+        }
+        precondition(negativeCases >= 100, "Negative fixture coverage regressed")
+        print("PASS: \(negativeCases) wrong recording/artist fixtures plus positive checks")
         print("PASS: 31 studio album-audio vs music-video matching assertions")
     }
 }

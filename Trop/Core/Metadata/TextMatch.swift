@@ -135,21 +135,35 @@ enum TextMatch {
     /// strips all parenthetical qualifiers. Otherwise "Niagara Falls
     /// (Instrumental)" becomes the same title as the vocal album recording.
     static func versionMarkers(_ value: String) -> Set<String> {
-        let words = Set(normalize(value).split(separator: " ").map(String.init))
+        // Read the unstripped title. Parentheses and suffixes can describe a
+        // different recording; normalizing them away before matching is unsafe.
+        let text = normalize(value)
+        let words = Set(text.split(separator: " ").map(String.init))
         var markers: Set<String> = []
         if words.contains("instrumental") || words.contains("instrumentals") {
             markers.insert("instrumental")
         }
-        for marker in ["karaoke", "remix", "live", "acoustic", "demo", "cover",
-                       "slowed", "nightcore", "clean"] where words.contains(marker) {
+        for marker in [
+            "karaoke", "remix", "mix", "live", "acoustic", "demo", "cover",
+            "slowed", "nightcore", "clean", "explicit", "extended", "bootleg",
+            "mashup", "medley", "rework", "edit", "remaster", "remastered",
+            "reverb", "tribute"
+        ] where words.contains(marker) {
             markers.insert(marker)
         }
         if words.contains("sped"), words.contains("up") {
             markers.insert("sped-up")
         }
-        if words.contains("a"), words.contains("cappella") {
+        if words.contains("a"), words.contains("cappella")
+            || words.contains("acapella") || words.contains("acappella") {
             markers.insert("acappella")
         }
+        if text.contains("radio edit") { markers.insert("radio-edit") }
+        if text.contains("radio mix") { markers.insert("radio-mix") }
+        if text.contains("album version") { markers.insert("album-version") }
+        if text.contains("single version") { markers.insert("single-version") }
+        if text.contains("en vivo") { markers.insert("live") }
+        if text.contains("original mix") { markers.insert("original-mix") }
         return markers
     }
 
@@ -264,6 +278,41 @@ extension TextMatch {
         let a = normalize(recordingTitle(lhs))
         let b = normalize(recordingTitle(rhs))
         return !a.isEmpty && a == b
+    }
+
+    /// Fail-closed policy for substituting audio from another catalogue.
+    /// Unlike a search-result ranking, missing performer and missing timing
+    /// without an exact album are NOT evidence of recording identity.
+    /// A FLAC/Atmos quality label cannot bypass this verification.
+    static func verifiedAudioSource(
+        wantedTitle: String,
+        wantedArtist: String,
+        wantedAlbum: String? = nil,
+        wantedDuration: Int? = nil,
+        candidateTitle: String,
+        candidateArtist: String?,
+        candidateAlbum: String? = nil,
+        candidateDuration: Int? = nil
+    ) -> Bool {
+        let performer = normalizeArtist(wantedArtist)
+        guard !performer.isEmpty,
+              let candidateArtist,
+              performer == normalizeArtist(candidateArtist),
+              recordingsMatch(wantedTitle, candidateTitle) else { return false }
+
+        let requestedRelease = normalize(wantedAlbum ?? "")
+        let foundRelease = normalize(candidateAlbum ?? "")
+        if !requestedRelease.isEmpty, !foundRelease.isEmpty,
+           requestedRelease != foundRelease { return false }
+
+        let releaseVerified = !requestedRelease.isEmpty
+            && !foundRelease.isEmpty && requestedRelease == foundRelease
+        if let wantedDuration, wantedDuration > 0,
+           let candidateDuration, candidateDuration > 0 {
+            // Allow codec rounding/lead-in but not a materially different mix.
+            return abs(candidateDuration - wantedDuration) <= max(8, wantedDuration / 30)
+        }
+        return releaseVerified
     }
 
     /// Catalogue text searches can return no hits when a video's comma-separated

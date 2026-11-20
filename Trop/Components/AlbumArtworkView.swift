@@ -15,7 +15,11 @@ struct SongArtworkView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            if let image = NowPlaying.shared.artwork(for: song.videoId) {
+            if let sourceCover = song.thumbnailUrl, !sourceCover.isEmpty {
+                // The selected row's cover is the release identity chosen by
+                // the user. Never swap it for a different catalogue edition.
+                AsyncImageView(url: sourceCover)
+            } else if let image = NowPlaying.shared.artwork(for: song.videoId) {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()
@@ -23,13 +27,16 @@ struct SongArtworkView: View {
                     .clipped()
             } else {
                 AsyncImageView(url: NowPlaying.shared.metadataSnapshot(for: song.videoId)?.artworkURL
-                               ?? (resolvedKey == taskKey ? resolvedURL : nil) ?? song.thumbnailUrl)
+                               ?? (resolvedKey == taskKey ? resolvedURL : nil))
             }
         }
             .task(id: taskKey) {
                 resolvedURL = nil
                 resolvedKey = taskKey
-                guard song.contentKind == nil || song.contentKind == .music,
+                // Don't make an external release lookup just to overwrite a
+                // valid selected cover. This also avoids per-row network work.
+                guard song.thumbnailUrl?.isEmpty != false,
+                      song.contentKind == nil || song.contentKind == .music,
                       !MusicPlaybackIdentity.isExternal(song.videoId) else { return }
                 let identity = TrackIdentity.make(from: song)
                 let metadata = await MetadataResolver.enrich(

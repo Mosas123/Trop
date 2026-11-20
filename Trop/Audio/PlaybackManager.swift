@@ -472,7 +472,9 @@ actor PlaybackManager {
         let query = artist.isEmpty ? title : "\(artist) \(title)"
         let client = JioSaavnClient()
         guard let tracks = try? await client.search(query: query, limit: 8),
-              let best = Self.bestCatalogMatch(tracks, title: title, artist: artist),
+              let best = Self.bestCatalogMatch(
+                   tracks, title: title, artist: artist, duration: song.duration
+               ),
               best.isStreamable,
               let url = try? await client.resolveStreamURL(for: best.id.rawValue),
               let finalURL = await Self.verifiedStreamURL(url.absoluteString) else {
@@ -940,30 +942,24 @@ actor PlaybackManager {
         return "Standard"
     }
 
-    private static func normalizedMatchKey(_ value: String) -> String {
-        value
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            .replacingOccurrences(of: "\\s*[\\[(][^\\])]*[\\])]", with: "", options: .regularExpression)
-            .replacingOccurrences(of: "[^a-z0-9 ]", with: "", options: .regularExpression)
-            .trimmingCharacters(in: .whitespaces)
-    }
-
+    /// A catalogue search is not evidence that its first title hit is the
+    /// requested recording. Missing artist or duration must fail closed.
     private static func bestCatalogMatch(
         _ tracks: [MusicCatalogTrack],
         title: String,
-        artist: String
+        artist: String,
+        duration: Int
     ) -> MusicCatalogTrack? {
-        let key = normalizedMatchKey(title)
-        guard !key.isEmpty else { return nil }
-        let artistKey = normalizedMatchKey(artist)
-        for track in tracks {
-            guard normalizedMatchKey(track.title) == key else { continue }
-            if artistKey.isEmpty { return track }
-            let trackArtist = normalizedMatchKey(track.artist)
-            if trackArtist.contains(artistKey) || artistKey.contains(trackArtist) { return track }
+        tracks.first { track in
+            TextMatch.verifiedAudioSource(
+                wantedTitle: title,
+                wantedArtist: artist,
+                wantedDuration: duration > 0 ? duration : nil,
+                candidateTitle: track.title,
+                candidateArtist: track.artist,
+                candidateDuration: track.durationSeconds
+            )
         }
-        // Exact title is required to avoid upgrading to the wrong song.
-        return tracks.first { normalizedMatchKey($0.title) == key }
     }
 
     /// Plays a downloaded copy if one exists, no matter which source it came
