@@ -94,6 +94,9 @@ final class PlayerController {
     private var wasPlayingBeforeInterruption = false
     private var apoloAudioInterruptionActive = false
     private var apoloLastInterruptionEndedAt: Date?
+    /// Ignore stale route notifications and avoid overriding a newer Play/Pause.
+    private var routeChangeGeneration: UInt64 = 0
+    private var playbackCommandGeneration: UInt64 = 0
     // Diagnostics only. Never used to decide when to resume or fall back.
     private var recoveryID: UInt64 = 0
     private var recoveryBegin: TimeInterval?
@@ -518,14 +521,31 @@ extension PlayerController {
         }
     }
 
-    func setPaused(_ paused: Bool) {
+    func setPaused(_ paused: Bool, forceBackendCommand: Bool = false) {
         if !paused { traceRecovery("playRequested") }
+        playbackCommandGeneration &+= 1
         sharedState.withLock { $0.desiredPlaying = !paused }
         let currentlyPaused = playState.value != .playing
-        guard currentlyPaused != paused else {
+        // A route handoff can pause/stall the renderer without first changing
+        // the UI's optimistic .playing state. Never discard a real Play command.
+        let apoloNeedsResume: Bool
+        if !paused, apoloIsActive {
+            if case .some(.playing) = apoloBackend?.state {
+                apoloNeedsResume = false
+            } else {
+                apoloNeedsResume = true
+            }
+        } else {
+            apoloNeedsResume = false
+        }
+        guard currentlyPaused != paused || forceBackendCommand || apoloNeedsResume else {
             updateNowPlayingProgress()
             return
         }
+        // Restore the session *before* asking AVPlayer/FFmpeg/mpv to resume.
+        // On Bluetooth handoff, the previous ordering could publish Play
+        // while the audio session had not yet been reactivated.
+        if !paused { assertAudioSession(reason: "setPaused") }
         if apoloIsActive {
             if paused { apoloBackend?.pause() } else { apoloBackend?.play() }
         } else {
@@ -541,7 +561,6 @@ extension PlayerController {
             NowPlaying.shared.radioPlaybackStatus = paused
                 ? .paused : (apoloIsActive ? .connecting : .live)
         }
-        if !paused { assertAudioSession(reason: "setPaused") }
         updateNowPlayingProgress()
     }
 
@@ -1323,9 +1342,9 @@ extension PlayerController {
                 }
                 self.traceRecovery("resumeTask")
                 self.assertAudioSession(reason: "legacyInterruptionEnded")
-                if self.playState.value != .playing {
-                    self.setPaused(false)
-                }
+                // An AVPlayer can remain paused after iOS reactivates the
+                // session even when the app's playState still says .playing.
+                self.setPaused(false, forceBackendCommand: true)
                 self.wasPlayingBeforeInterruption = false
             }
         @unknown default:
@@ -1359,8 +1378,59 @@ extension PlayerController {
               let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else { return }
 
         Log.player.info("ROUTE_CHANGE reason=\(reason.rawValue)")
-        if reason == .oldDeviceUnavailable, playState.value == .playing {
-            Task { @MainActor in togglePlayPause() }
+        let event: AudioRouteChangePolicy.Event
+        switch reason {
+        case .newDeviceAvailable:
+            event = .newDeviceAvailable
+        case .oldDeviceUnavailable:
+            event = .oldDeviceUnavailable
+        default:
+            return
+        }
+
+        routeChangeGeneration &+= 1
+        let routeGeneration = routeChangeGeneration
+        let commandGeneration = playbackCommandGeneration
+        let requestSerial = playRequestSerial
+        let selectedID = NowPlaying.shared.videoId
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if case .oldDeviceUnavailable = event {
+                // A headset-to-headset handoff can briefly report the old
+                // output disappearing before the new Bluetooth route settles.
+                // Do not turn that transient gap into a user-requested pause.
+                do { try await Task.sleep(for: .milliseconds(350)) }
+                catch { return }
+            }
+            let sameRequest = self.routeChangeGeneration == routeGeneration
+                && self.playbackCommandGeneration == commandGeneration
+                && self.playRequestSerial == requestSerial
+                && NowPlaying.shared.videoId == selectedID
+            let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+            let builtInOutput = outputs.isEmpty || outputs.allSatisfy {
+                $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver
+            }
+            let action = AudioRouteChangePolicy.action(
+                for: event,
+                desiredPlaying: self.sharedState.withLock { $0.desiredPlaying },
+                isInterrupted: self.apoloAudioInterruptionActive,
+                isCurrentRequest: sameRequest,
+                outputIsBuiltIn: builtInOutput
+            )
+            switch action {
+            case .pause:
+                // Respect privacy when headphones were actually disconnected.
+                self.setPaused(true)
+            case .resume:
+                // A new Bluetooth route should not require selecting a
+                // different radio. Reassert the session and kick the backend.
+                self.setPaused(false, forceBackendCommand: true)
+            case .ignore:
+                break
+            }
+            Log.player.info(
+                "ROUTE_RECOVERY reason=\(reason.rawValue) action=\(String(describing: action)) builtIn=\(builtInOutput) current=\(sameRequest)"
+            )
         }
     }
 }
