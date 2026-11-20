@@ -41,6 +41,21 @@ enum AddonSourceResolver {
         let queries: [String]
     }
 
+    /// Every addon entry point (search, album cache, lossless and AAC) must
+    /// pass the same identity test before a URL or quality tier is considered.
+    private static func verified(_ track: AddonTrack, for criteria: Criteria) -> Bool {
+        TextMatch.verifiedAudioSource(
+            wantedTitle: criteria.title,
+            wantedArtist: criteria.artist,
+            wantedAlbum: criteria.album,
+            wantedDuration: criteria.duration,
+            candidateTitle: track.title,
+            candidateArtist: track.artist,
+            candidateAlbum: track.album,
+            candidateDuration: track.durationSeconds
+        )
+    }
+
     /// Tries the healthiest addons first, two at a time, and only falls back to
     /// the rest when the first batch has no lossless answer. This keeps a single
     /// lookup to a handful of requests instead of querying every addon.
@@ -82,7 +97,8 @@ enum AddonSourceResolver {
             preferAtmos: preferAtmos,
             preferHiRes: preferHiRes
         )
-        if let cached = await AddonMatchCache.shared.get(cacheKey) {
+        if let cached = await AddonMatchCache.shared.get(cacheKey),
+           Self.verified(cached.track, for: criteria) {
             return cached
         }
 
@@ -313,14 +329,7 @@ enum AddonSourceResolver {
         return found.filter { track in
             if track.isAtmosOnly, !preferAtmos { return false }
             if track.isHiRes, !preferHiRes { return false }
-            guard TextMatch.titlesMatch(track.title, criteria.title) else { return false }
-            if let trackArtist = track.artist, !trackArtist.isEmpty, !criteria.artist.isEmpty,
-               !TextMatch.artistsMatch(trackArtist, criteria.artist) { return false }
-            if let album = criteria.album, !album.isEmpty, let trackAlbum = track.album, !trackAlbum.isEmpty,
-               !TextMatch.albumsMatch(trackAlbum, album) { return false }
-            if let duration = criteria.duration, let trackDuration = track.durationSeconds, trackDuration > 0,
-               abs(trackDuration - duration) > 20 { return false }
-            return true
+            return Self.verified(track, for: criteria)
         }
     }
 
@@ -380,19 +389,11 @@ enum AddonSourceResolver {
         preferAtmos: Bool,
         preferHiRes: Bool
     ) -> [AddonTrack] {
-        var matches = tracks.filter { track in
-            guard !(track.isAtmosOnly && !preferAtmos) else { return false }
-            guard !(track.isHiRes && !preferHiRes) else { return false }
-            return TextMatch.titlesMatch(track.title, criteria.title)
+        return tracks.filter { track in
+            guard !(track.isAtmosOnly && !preferAtmos),
+                  !(track.isHiRes && !preferHiRes) else { return false }
+            return Self.verified(track, for: criteria)
         }
-        if let duration = criteria.duration {
-            let tight = matches.filter { track in
-                guard let seconds = track.durationSeconds, seconds > 0 else { return false }
-                return abs(seconds - duration) <= 5
-            }
-            if !tight.isEmpty { matches = tight }
-        }
-        return matches
     }
 
     private static func albumKey(installationKey: String, artist: String, album: String) -> String {
