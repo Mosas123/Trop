@@ -27,8 +27,8 @@ struct AudioRouteChangeChecks {
     static func main() {
         check(.newDeviceAvailable, expected: .resume,
               "Connecting AirPods resumes the current radio")
-        check(.newDeviceAvailable, builtIn: true, expected: .resume,
-              "The new-device event is not an unplugged-headphone pause")
+        check(.newDeviceAvailable, builtIn: true, expected: .ignore,
+              "Unsettled new-device route must not play through the speaker")
         check(.oldDeviceUnavailable, builtIn: true, expected: .pause,
               "Unplugging headphones to the built-in speaker pauses for privacy")
         check(.oldDeviceUnavailable, builtIn: false, expected: .resume,
@@ -46,6 +46,54 @@ struct AudioRouteChangeChecks {
               "A stale route event cannot restart a newly selected station")
         check(.oldDeviceUnavailable, current: false, builtIn: true,
               expected: .ignore, "A delayed unplug event cannot pause a later Play command")
+
+        // iOS 27.3 reproduction: old headphones disappear, iOS interrupts
+        // the session and a new Bluetooth output arrives several seconds later.
+        // Only the same playback identity may resume on an external route.
+        let createdAt = Date(timeIntervalSince1970: 100)
+        let handoff = AudioRouteHandoffIntent(
+            playbackID: "radio:station-a",
+            playbackGeneration: 8,
+            expiresAt: createdAt.addingTimeInterval(15)
+        )
+        func permitted(
+            id: String? = "radio:station-a",
+            generation: Int = 8,
+            at offset: TimeInterval = 8,
+            builtIn: Bool = false,
+            interrupted: Bool = false
+        ) -> Bool {
+            handoff.permitsResume(
+                playbackID: id,
+                playbackGeneration: generation,
+                now: createdAt.addingTimeInterval(offset),
+                outputIsBuiltIn: builtIn,
+                isInterrupted: interrupted
+            )
+        }
+        precondition(permitted(), "Same station may recover on replacement AirPods")
+        checks += 1
+        precondition(!permitted(builtIn: true),
+                     "Never auto-play on the phone speaker after unplugging")
+        checks += 1
+        precondition(!permitted(interrupted: true),
+                     "Do not attempt to play before iOS interruption ends")
+        checks += 1
+        precondition(!permitted(id: "radio:station-b"),
+                     "A station change cancels the previous route resume")
+        checks += 1
+        precondition(!permitted(generation: 9),
+                     "A new user playback intent cancels a stale handoff")
+        checks += 1
+        precondition(!permitted(at: 15),
+                     "Expired auto-resume permissions are never valid")
+        checks += 1
+        precondition(!permitted(at: 120),
+                     "A long-disconnected headset must not auto-play")
+        checks += 1
+        precondition(!permitted(id: nil),
+                     "Without an active playback ID do not resume")
+        checks += 1
 
         print("PASS: \(checks) Bluetooth route-change recovery checks")
     }

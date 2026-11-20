@@ -5,6 +5,7 @@ on:
     paths:
       - "Trop/Audio/PlaybackIntentGuard.swift"
       - "Trop/Audio/PlayerController/PlayerController.swift"
+      - "Trop/Audio/PlayerController/AudioRouteChangePolicy.swift"
       - "Trop/Audio/NowPlaying.swift"
       - "Trop/SponsorBlock/SponsorBlockSkipPolicy.swift"
       - "Trop/SponsorBlock/SponsorBlockIntegration.swift"
@@ -25,3 +26,11 @@ jobs:
             tests/Playback/PlaybackGuardChecks.swift \
             -o "$RUNNER_TEMP/playback-guard-checks"
           "$RUNNER_TEMP/playback-guard-checks"
+      - name: Verify headphone handoff and iOS interruption recovery policies
+        run: |
+          set -euo pipefail
+          swiftc \
+            Trop/Audio/PlayerController/AudioRouteChangePolicy.swift \
+            tests/Playback/AudioRouteChangeChecks.swift \
+            -o "$RUNNER_TEMP/audio-route-change-checks"
+          "$RUNNER_TEMP/audio-route-change-checks"
