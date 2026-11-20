@@ -1382,6 +1382,7 @@ extension PlayerController {
     func setNowPlayingMetadata() {
         assertAudioSession(reason: "metadata")
         let np = NowPlaying.shared
+        let isLiveRadio = np.playbackKind == .radio
         nowPlayingInfo.removeAll()
 
         let liveDur: Double = apoloIsActive
@@ -1392,7 +1393,7 @@ extension PlayerController {
                 return val
             } ?? 0)
         let duration = liveDur > 0 ? liveDur : np.duration
-        if duration > 0 { np.duration = duration }
+        if !isLiveRadio, duration > 0 { np.duration = duration }
 
         let livePos: Double = apoloIsActive
             ? (apoloBackend?.currentTime ?? 0)
@@ -1409,8 +1410,14 @@ extension PlayerController {
         nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = np.isPlaying ? 1 : 0
         nowPlayingInfo[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
         nowPlayingInfo[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1
-        if duration > 0 { nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = duration }
-        nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsed
+        // Tell iOS this is a true non-seekable live broadcast rather than a
+        // zero-length file. Never publish fake elapsed/duration values for radio.
+        nowPlayingInfo[MPNowPlayingInfoPropertyIsLiveStream] = NSNumber(value: isLiveRadio)
+        if !isLiveRadio {
+            if duration > 0 { nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = duration }
+            nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsed
+        }
+        MPRemoteCommandCenter.shared().changePlaybackPositionCommand.isEnabled = !isLiveRadio
         nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackQueueIndex] = np.queueIndex
         nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackQueueCount] = np.queueSongs.count
         if let image = np.thumbnailUIImage {
@@ -1434,8 +1441,24 @@ extension PlayerController {
     }
 
     func updateNowPlayingProgress() {
+        let np = NowPlaying.shared
+        if np.playbackKind == .radio {
+            // Keep the live marker even across pause, audio route changes and
+            // periodic progress refreshes. Fake 0:00 makes iOS show --:--.
+            var info = nowPlayingInfo
+            info[MPNowPlayingInfoPropertyIsLiveStream] = NSNumber(value: true)
+            info.removeValue(forKey: MPMediaItemPropertyPlaybackDuration)
+            info.removeValue(forKey: MPNowPlayingInfoPropertyElapsedPlaybackTime)
+            info.removeValue(forKey: MPNowPlayingInfoPropertyPlaybackProgress)
+            info[MPNowPlayingInfoPropertyPlaybackRate] = np.isPlaying ? 1 : 0
+            nowPlayingInfo = info
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+            MPNowPlayingInfoCenter.default().playbackState =
+                np.isPlaying ? .playing : .paused
+            return
+        }
         let props: (dur: Double, pos: Double)? = apoloIsActive
-            ? (max(apoloBackend?.duration ?? 0, NowPlaying.shared.duration),
+            ? (max(apoloBackend?.duration ?? 0, np.duration),
                apoloBackend?.currentTime ?? 0)
             : withMpv { mpv in
                 var dur = Double(0)
@@ -1445,20 +1468,6 @@ extension PlayerController {
                 return (dur, pos)
             }
         guard var props else { return }
-        let np = NowPlaying.shared
-        if np.playbackKind == .radio {
-            // Live radio has no finite duration, but pause/lock-screen rate
-            // still needs publishing even when progress cannot be displayed.
-            var info = nowPlayingInfo
-            info.removeValue(forKey: MPMediaItemPropertyPlaybackDuration)
-            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = 0
-            info[MPNowPlayingInfoPropertyPlaybackRate] = np.isPlaying ? 1 : 0
-            nowPlayingInfo = info
-            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
-            MPNowPlayingInfoCenter.default().playbackState =
-                np.isPlaying ? .playing : .paused
-            return
-        }
         guard props.dur > 0 else { return }
 
         if let seek = pendingSeek {
