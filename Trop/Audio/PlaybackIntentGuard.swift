@@ -57,3 +57,21 @@ enum PlaybackPausePolicy {
         !desiredPlaying || audioInterruptionActive
     }
 }
+
+
+/// Diagnostic classification only: never changes EOF handling or the queue.
+/// Not every reported duration is exact; require both a meaningful absolute
+/// and relative gap before flagging a suspicious early finish in device logs.
+enum PlaybackEndEvidence {
+    static func isMateriallyEarly(
+        decoderPosition: TimeInterval,
+        expectedDuration: TimeInterval
+    ) -> Bool {
+        guard decoderPosition.isFinite,
+              expectedDuration.isFinite,
+              decoderPosition >= 0,
+              expectedDuration >= 30 else { return false }
+        let missing = expectedDuration - decoderPosition
+        return missing >= 8 && missing / expectedDuration >= 0.05
+    }
+}

@@ -157,6 +157,41 @@ struct PlaybackGuardChecks {
         precondition(pausedLoading.hasTimedOut(
             now: at(120.1), isInterrupted: false, interruptionEndedAt: nil
         ), "An actual stall after Play must still reach the mpv fallback")
+        // Diagnostic policy must not mislabel ordinary or unknown-duration EOFs.
+        precondition(PlaybackEndEvidence.isMateriallyEarly(
+            decoderPosition: 162.786,
+            expectedDuration: 183.685
+        ), "NUEVAYoL early EOF must be visible in diagnostics")
+        precondition(!PlaybackEndEvidence.isMateriallyEarly(
+            decoderPosition: 182.5,
+            expectedDuration: 183.685
+        ), "Natural end with encoder padding must not be flagged")
+        precondition(!PlaybackEndEvidence.isMateriallyEarly(
+            decoderPosition: 150,
+            expectedDuration: 0
+        ), "Unknown stream duration is not an early EOF")
+        precondition(!PlaybackEndEvidence.isMateriallyEarly(
+            decoderPosition: 19,
+            expectedDuration: 25
+        ), "A short clip is not a long-track early-EOF signal")
+        precondition(!PlaybackEndEvidence.isMateriallyEarly(
+            decoderPosition: 10,
+            expectedDuration: .nan
+        ), "Invalid media durations must never create a false alarm")
+        precondition(!PlaybackEndEvidence.isMateriallyEarly(
+            decoderPosition: .infinity,
+            expectedDuration: 180
+        ), "Invalid decoder positions must never create a false alarm")
+        precondition(!PlaybackEndEvidence.isMateriallyEarly(
+            decoderPosition: 175,
+            expectedDuration: 180
+        ), "Under 8 seconds deficit is not materially early")
+        precondition(!PlaybackEndEvidence.isMateriallyEarly(
+            decoderPosition: 192,
+            expectedDuration: 200
+        ), "At least 5 percent difference is also required")
+        print("PASS: 8 early-EOF evidence classification regression checks")
+
         print("PASS: 6 real finite-audio watchdog pause/resume/timeout checks")
 
         print("PASS: 17 pause/EOF/fallback/quality-change intent regression checks")

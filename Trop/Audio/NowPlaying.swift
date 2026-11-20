@@ -403,6 +403,14 @@ final class NowPlaying {
     }
 
     func playNext(automatic: Bool = false) {
+        let decoderPosition = PlayerController.shared.currentTime
+        Log.nowPlaying.info(
+            "QUEUE_ADVANCE requested cause=\(automatic ? "automatic" : "manual") "
+                + "videoId=\(videoId ?? "nil") gen=\(playbackGeneration) "
+                + "position=\(String(format: "%.3f", decoderPosition)) "
+                + "publishedDuration=\(String(format: "%.3f", duration)) "
+                + "hasNext=\(hasNext) resolving=\(isResolvingNext)"
+        )
         guard hasNext else { return }
         guard !isResolvingNext else { return }
         if !automatic {
@@ -439,6 +447,11 @@ final class NowPlaying {
             isResolvingNext = true
         }
         let song = queueSongs[queueIndex]
+        Log.nowPlaying.info(
+            "QUEUE_ADVANCE selected context=\(logContext) "
+                + "videoId=\(song.videoId) previous=\(videoId ?? "nil") "
+                + "gen=\(intent) index=\(queueIndex)"
+        )
         update(with: song)
         persistQueueState()
         Task {
@@ -693,6 +706,17 @@ final class NowPlaying {
 
     func stopped(videoId: String?, isEof: Bool = true) {
         guard self.videoId == videoId else { return }
+        let decoderPosition = PlayerController.shared.currentTime
+        let early = isEof && PlaybackEndEvidence.isMateriallyEarly(
+            decoderPosition: decoderPosition, expectedDuration: duration
+        )
+        Log.nowPlaying.info(
+            "PLAYBACK_END received reason=\(isEof ? "eof" : "failure") "
+                + "videoId=\(videoId ?? "nil") gen=\(playbackGeneration) "
+                + "decoderPosition=\(String(format: "%.3f", decoderPosition)) "
+                + "publishedDuration=\(String(format: "%.3f", duration)) "
+                + "early=\(early) kind=\(String(describing: playbackKind))"
+        )
         if playbackKind == .radio {
             // Radio is an indefinite station, never a completed queue song.
             // Avoid YouTube re-resolve/queue advance after a station error.

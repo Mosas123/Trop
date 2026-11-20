@@ -2071,6 +2071,7 @@ extension PlayerController {
             guard let self else { return }
             let begun = Date()
             var loggedPlaying = false
+            var firstObservedPlayingAt: Date?
             var liveRadioWatchdog = ApoloLiveRadioWatchdog()
             var finiteAudioWatchdog = ApoloFiniteAudioWatchdog()
             while !Task.isCancelled {
@@ -2106,6 +2107,24 @@ extension PlayerController {
                 }
                 switch backend.state {
                 case .finished:
+                    let decoderPosition = backend.currentTime
+                    let mediaDuration = backend.duration
+                    let publishedDuration = NowPlaying.shared.duration
+                    let early = PlaybackEndEvidence.isMateriallyEarly(
+                        decoderPosition: decoderPosition,
+                        expectedDuration: mediaDuration > 0 ? mediaDuration : publishedDuration
+                    )
+                    let elapsedPlaying = firstObservedPlayingAt.map {
+                        String(format: "%.3f", Date().timeIntervalSince($0))
+                    } ?? "unconfirmed"
+                    Log.player.warning(
+                        "APOLO_BETA finished videoId=\(videoId ?? "nil") gen=\(generation) "
+                            + "decoderPosition=\(String(format: "%.3f", decoderPosition)) "
+                            + "mediaDuration=\(String(format: "%.3f", mediaDuration)) "
+                            + "publishedDuration=\(String(format: "%.3f", publishedDuration)) "
+                            + "elapsedPlaying=\(elapsedPlaying) early=\(early) "
+                            + "desired=\(self.wantsPlayback)"
+                    )
                     if isLiveRadio {
                         // A live station ending is a stream error, not an EOF
                         // that advances the user's music queue.
@@ -2175,9 +2194,13 @@ extension PlayerController {
                     }
                     if !loggedPlaying {
                         loggedPlaying = true
+                        firstObservedPlayingAt = Date()
                         self.traceRecovery("apoloPlaying")
                         Log.player.info(
-                            "APOLO_BETA firstPlaying videoId=\(videoId ?? "nil") ms=\(Self.msSince(begun))"
+                            "APOLO_BETA firstPlaying videoId=\(videoId ?? "nil") "
+                                + "ms=\(Self.msSince(begun)) "
+                                + "decoderPosition=\(String(format: "%.3f", backend.currentTime)) "
+                                + "mediaDuration=\(String(format: "%.3f", backend.duration))"
                         )
                     }
                     if self.playState.value != .playing {
