@@ -42,6 +42,43 @@ enum MusicRecordingSelectionPolicy {
             && abs(expectedDuration - resolvedDuration) > 18
     }
 
+    /// A song selection (including a song surfaced by an album) is not consent
+    /// to substitute the soundtrack of an OMV/UGC clip. If the verified ATV
+    /// lookup fails, the caller must try a separately verified music source
+    /// or report unavailable rather than silently playing that video mix.
+    static func forbidsVideoSoundtrack(
+        selectedVideo: Bool,
+        rowType: String?,
+        sourceType: String?,
+        rowIsVideo: Bool = false
+    ) -> Bool {
+        !selectedVideo && !isStudioAudio(sourceType) && (
+            rowIsVideo || isVideoRecording(rowType)
+                || isVideoRecording(sourceType)
+        )
+    }
+
+    /// Source-first lookup is required when a user explicitly prefers an
+    /// external quality tier and music addons are configured. Auto/High can
+    /// also check independently verified 320 kbps sources. Playback never
+    /// skips this step merely because the song was not prefetched.
+    static func shouldProbeSourcesBeforeYouTube(
+        mode: String,
+        hasAddons: Bool,
+        prefers320: Bool
+    ) -> Bool {
+        (hasAddons && mode != "off") || prefers320
+    }
+
+    /// The High (320 kbps) tier must not quietly reuse a prior FLAC
+    /// prefetch from a different setting. Auto/FLAC settings keep their own
+    /// acceptance rules in PlaybackManager.
+    static func acceptsPrefetchedQuality(mode: String, quality: String) -> Bool {
+        guard mode == "high" else { return true }
+        let label = quality.lowercased()
+        return label.contains("jiosaavn") || label.contains("addon-aac")
+    }
+
     /// Do not use fuzzy substring title matches for audio substitution.
     /// Exact recording title, real performer credits and close duration or
     /// verified album identity are required. Remixes/live/covers must not

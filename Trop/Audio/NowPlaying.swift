@@ -495,7 +495,11 @@ final class NowPlaying {
             confirmedMetadata = nil
             publishedArtwork = nil
         }
-        self.isPlaying = true
+        // Metadata publication must not turn a paused selection back into
+        // an optimistic "playing" UI state while audio is still loading.
+        self.isPlaying = PlayerController.shared.wantsPlaybackForSelection(
+            videoId: videoId
+        )
         enrichTask?.cancel()
         liveResolveTask?.cancel()
         self.title = title
@@ -715,6 +719,18 @@ final class NowPlaying {
         if let finishedId = videoId,
            duration >= 600 || musicVideoType == "MUSIC_VIDEO_TYPE_PODCAST_EPISODE" {
             Task { await EpisodePlaybackStore.shared.markPlayed(videoId: finishedId) }
+        }
+        // EOF can arrive after a user paused or while Apolo was preparing
+        // the next item. It must never consume the queue behind a Pause.
+        guard PlayerController.shared.canAdvanceQueueAutomatically else {
+            Log.nowPlaying.info(
+                "PLAYBACK_INTENT EOF held on pause videoId=\(videoId ?? "nil") gen=\(playbackGeneration)"
+            )
+            isPlaying = false
+            stopTimer()
+            PlayerController.shared.updateNowPlayingProgress()
+            Task { await PlaybackStateService.shared.stopTracking() }
+            return
         }
         if isRepeatOn {
             repeatCurrent()

@@ -267,6 +267,67 @@ struct StudioAudioMatchChecks {
             width: 640, height: 480
         ), "sddefault may be used as a last-resort fallback")
         print("PASS: 13 verified-album cover, edition and preview-size checks")
+        // Source-first regression (IPA #398): no cached upgrade must not
+        // turn a song selection into an unsolicited OMV soundtrack.
+        precondition(MusicRecordingSelectionPolicy.shouldProbeSourcesBeforeYouTube(
+            mode: "lossless", hasAddons: true, prefers320: false
+        ), "Best FLAC requires a cold-start provider lookup")
+        precondition(MusicRecordingSelectionPolicy.shouldProbeSourcesBeforeYouTube(
+            mode: "cd", hasAddons: true, prefers320: false
+        ), "CD FLAC requires a cold-start provider lookup")
+        precondition(MusicRecordingSelectionPolicy.shouldProbeSourcesBeforeYouTube(
+            mode: "high", hasAddons: true, prefers320: true
+        ), "High must search verified 320 kbps sources first")
+        precondition(MusicRecordingSelectionPolicy.shouldProbeSourcesBeforeYouTube(
+            mode: "auto", hasAddons: true, prefers320: true
+        ), "Auto with addons must search before using video soundtrack")
+        precondition(MusicRecordingSelectionPolicy.shouldProbeSourcesBeforeYouTube(
+            mode: "high", hasAddons: false, prefers320: true
+        ), "High without addons must still consider JioSaavn")
+        precondition(!MusicRecordingSelectionPolicy.shouldProbeSourcesBeforeYouTube(
+            mode: "off", hasAddons: false, prefers320: false
+        ), "Off mode cannot demand unavailable providers")
+        precondition(MusicRecordingSelectionPolicy.forbidsVideoSoundtrack(
+            selectedVideo: false,
+            rowType: "MUSIC_VIDEO_TYPE_OMV", sourceType: nil
+        ), "NUEVAYoL album selection must not silently play the OMV mix")
+        precondition(MusicRecordingSelectionPolicy.forbidsVideoSoundtrack(
+            selectedVideo: false,
+            rowType: nil, sourceType: "MUSIC_VIDEO_TYPE_UGC"
+        ), "A UGC result cannot replace a selected studio recording")
+        precondition(MusicRecordingSelectionPolicy.forbidsVideoSoundtrack(
+            selectedVideo: false,
+            rowType: nil, sourceType: nil, rowIsVideo: true
+        ), "Explicitly classified video rows are not audio masters")
+        precondition(!MusicRecordingSelectionPolicy.forbidsVideoSoundtrack(
+            selectedVideo: true,
+            rowType: "MUSIC_VIDEO_TYPE_OMV", sourceType: nil
+        ), "Explicit music-video choice may play the chosen soundtrack")
+        precondition(!MusicRecordingSelectionPolicy.forbidsVideoSoundtrack(
+            selectedVideo: false,
+            rowType: "MUSIC_VIDEO_TYPE_OMV",
+            sourceType: "MUSIC_VIDEO_TYPE_ATV"
+        ), "Positively verified ATV takes precedence over stale row markers")
+        precondition(!MusicRecordingSelectionPolicy.forbidsVideoSoundtrack(
+            selectedVideo: false, rowType: nil, sourceType: nil
+        ), "Unknown song types must not be rejected without evidence")
+        precondition(MusicRecordingSelectionPolicy.acceptsPrefetchedQuality(
+            mode: "high", quality: "addon-aac-320"
+        ), "High accepts validated addon AAC 320")
+        precondition(MusicRecordingSelectionPolicy.acceptsPrefetchedQuality(
+            mode: "high", quality: "jiosaavn-320"
+        ), "High accepts validated JioSaavn 320")
+        precondition(!MusicRecordingSelectionPolicy.acceptsPrefetchedQuality(
+            mode: "high", quality: "addon-hi-res"
+        ), "High must not silently re-use a cached FLAC from Best FLAC mode")
+        precondition(!MusicRecordingSelectionPolicy.acceptsPrefetchedQuality(
+            mode: "high", quality: "addon-atmos"
+        ), "High must not unexpectedly choose an Atmos stream")
+        precondition(MusicRecordingSelectionPolicy.acceptsPrefetchedQuality(
+            mode: "lossless", quality: "addon-cd"
+        ), "Best FLAC remains eligible for verified lossless")
+        print("PASS: 5 quality-tier cache policies")
+        print("PASS: 12 source-first and forbidden-video soundtrack policies")
         print("PASS: 31 studio album-audio vs music-video matching assertions")
     }
 }

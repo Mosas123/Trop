@@ -6,6 +6,7 @@ on:
       - "Trop/Audio/PlaybackIntentGuard.swift"
       - "Trop/Audio/PlayerController/PlayerController.swift"
       - "Trop/Audio/PlayerController/AudioRouteChangePolicy.swift"
+      - "Trop/Audio/PlayerController/ApoloFiniteAudioWatchdog.swift"
       - "Trop/Audio/NowPlaying.swift"
       - "Trop/SponsorBlock/SponsorBlockSkipPolicy.swift"
       - "Trop/SponsorBlock/SponsorBlockIntegration.swift"
@@ -22,6 +23,7 @@ jobs:
           set -euo pipefail
           swiftc \
             Trop/Audio/PlaybackIntentGuard.swift \
+            Trop/Audio/PlayerController/ApoloFiniteAudioWatchdog.swift \
             Trop/SponsorBlock/SponsorBlockSkipPolicy.swift \
             tests/Playback/PlaybackGuardChecks.swift \
             -o "$RUNNER_TEMP/playback-guard-checks"

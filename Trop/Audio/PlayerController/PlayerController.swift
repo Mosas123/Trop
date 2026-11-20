@@ -99,6 +99,38 @@ final class PlayerController {
     /// Ignore stale route notifications and avoid overriding a newer Play/Pause.
     private var routeChangeGeneration: UInt64 = 0
     private var playbackCommandGeneration: UInt64 = 0
+    /// A real user Pause fences every delayed load for this selection,
+    /// including mpv fallback. An unrelated new selection can still play.
+    private var explicitlyPausedSelectionGeneration: Int?
+    private var explicitlyPausedSelectionVideoId: String?
+    private var lastStartedSelectionGeneration: Int?
+    private var lastStartedSelectionVideoId: String?
+    var wantsPlayback: Bool { sharedState.withLock { $0.desiredPlaying } }
+    private func userPauseGeneration(for videoId: String?) -> Int? {
+        guard explicitlyPausedSelectionVideoId == videoId else { return nil }
+        return explicitlyPausedSelectionGeneration
+    }
+    var isExplicitlyPausedForCurrentSelection: Bool {
+        userPauseGeneration(for: NowPlaying.shared.videoId)
+            == NowPlaying.shared.playbackGeneration
+    }
+    func wantsPlaybackForSelection(videoId: String) -> Bool {
+        PlaybackPausePolicy.shouldPlay(
+            generation: NowPlaying.shared.playbackGeneration,
+            explicitlyPausedGeneration: userPauseGeneration(for: videoId),
+            desiredPlaying: wantsPlayback,
+            isNewSelection: lastStartedSelectionGeneration != NowPlaying.shared.playbackGeneration
+                || lastStartedSelectionVideoId != videoId,
+            isEngineFallback: false
+        )
+    }
+    var canAdvanceQueueAutomatically: Bool {
+        PlaybackPausePolicy.shouldAdvanceAutomatically(
+            generation: NowPlaying.shared.playbackGeneration,
+            explicitlyPausedGeneration: userPauseGeneration(for: NowPlaying.shared.videoId),
+            desiredPlaying: wantsPlayback
+        )
+    }
     // Diagnostics only. Never used to decide when to resume or fall back.
     private var recoveryID: UInt64 = 0
     private var recoveryBegin: TimeInterval?
@@ -321,6 +353,28 @@ extension PlayerController {
             Log.player.error("Invalid playback source URL")
             return
         }
+        let currentSelectionGeneration = NowPlaying.shared.playbackGeneration
+        if !bypassApolo {
+            let isNewSelection = lastStartedSelectionGeneration != currentSelectionGeneration
+                || lastStartedSelectionVideoId != videoId
+            let shouldPlay = PlaybackPausePolicy.shouldPlay(
+                generation: currentSelectionGeneration,
+                explicitlyPausedGeneration: userPauseGeneration(for: videoId),
+                desiredPlaying: wantsPlayback,
+                isNewSelection: isNewSelection,
+                isEngineFallback: false
+            )
+            lastStartedSelectionGeneration = currentSelectionGeneration
+            lastStartedSelectionVideoId = videoId
+            sharedState.withLock { $0.desiredPlaying = shouldPlay }
+            Log.player.info(
+                "PLAYBACK_INTENT load gen=\(currentSelectionGeneration) fresh=\(isNewSelection) desired=\(shouldPlay)"
+            )
+        } else {
+            Log.player.info(
+                "PLAYBACK_INTENT mpvFallback gen=\(currentSelectionGeneration) desired=\(wantsPlayback)"
+            )
+        }
 
         // SponsorBlock may await its segment prefetch. Do not change the
         // displayed title, stream quality or progress until the request still
@@ -425,7 +479,8 @@ extension PlayerController {
         let prevVideoId = sharedState.withLock { $0.currentVideoId }
         let isNewSong = prevVideoId != nil && videoId != prevVideoId
 
-        sharedState.withLock { $0.desiredPlaying = true }
+        // The source may have resolved AFTER the user pressed Pause.
+        // Never reset desiredPlaying merely because mpv is loading.
         assertAudioSession()
         loadedMuxedURL = nil
         loadedVideoOnlyURL = nil
@@ -468,10 +523,10 @@ extension PlayerController {
             "TRANSITION play videoId=\(videoId ?? "nil") isNewSong=\(isNewSong) muxedActive=\(muxedActive) "
                 + "source=\(Self.apoloSource(url))"
         )
-        let holdForInterruption = apoloAudioInterruptionActive
+        let holdForPauseOrInterruption = apoloAudioInterruptionActive || !wantsPlayback
         let cmdResult = withMpv { mpv -> Int32 in
             mpv_set_property_string(
-                mpv, "pause", holdForInterruption ? "yes" : "no"
+                mpv, "pause", holdForPauseOrInterruption ? "yes" : "no"
             )
             return loadArguments.withUnsafeCArg { mpv_command(mpv, $0) }
         } ?? -1
@@ -549,10 +604,18 @@ extension PlayerController {
         forceBackendCommand: Bool = false,
         systemRecovery: Bool = false
     ) {
-        if paused && !systemRecovery {
-            // An explicit Pause cancels every pending automatic resume.
-            wasPlayingBeforeInterruption = false
-            headsetHandoffIntent = nil
+        if !systemRecovery {
+            // Pause, Play and explicit commands must survive every async load.
+            explicitlyPausedSelectionGeneration = paused
+                ? NowPlaying.shared.playbackGeneration : nil
+            explicitlyPausedSelectionVideoId = paused ? NowPlaying.shared.videoId : nil
+            if paused {
+                wasPlayingBeforeInterruption = false
+                headsetHandoffIntent = nil
+            }
+            Log.player.info(
+                "PLAYBACK_INTENT userCommand=\(paused ? "pause" : "play") gen=\(NowPlaying.shared.playbackGeneration)"
+            )
         }
         if !paused { traceRecovery("playRequested") }
         playbackCommandGeneration &+= 1
@@ -1843,7 +1906,8 @@ extension PlayerController {
         sharedState.withLock {
             $0.currentVideoId = videoId
             $0.pendingVideoId = nil
-            $0.desiredPlaying = true
+            // Do not overwrite a user Pause received while the stream
+            // was resolving or during AVFoundation load.
         }
         // Stop mpv before Apolo starts; an EOF emitted by the old mpv item
         // must never advance Thrum's queue while Apolo owns playback.
@@ -2091,7 +2155,10 @@ extension PlayerController {
                         }
                     } else if finiteAudioWatchdog.hasTimedOut(
                         now: Date(),
-                        isInterrupted: self.apoloAudioInterruptionActive,
+                        isInterrupted: PlaybackPausePolicy.watchdogIsSuspended(
+                            desiredPlaying: self.wantsPlayback,
+                            audioInterruptionActive: self.apoloAudioInterruptionActive
+                        ),
                         interruptionEndedAt: self.apoloLastInterruptionEndedAt
                     ) {
                         Log.player.warning("APOLO_BETA recovery loading timeout; using mpv fallback")
@@ -2141,7 +2208,10 @@ extension PlayerController {
                         )
                         : finiteAudioWatchdog.hasTimedOut(
                             now: Date(),
-                            isInterrupted: self.apoloAudioInterruptionActive,
+                            isInterrupted: PlaybackPausePolicy.watchdogIsSuspended(
+                                desiredPlaying: self.wantsPlayback,
+                                audioInterruptionActive: self.apoloAudioInterruptionActive
+                            ),
                             interruptionEndedAt: self.apoloLastInterruptionEndedAt
                         )
                     if idleTimedOut {
@@ -2172,6 +2242,9 @@ extension PlayerController {
         }
         let position = isLiveRadio ? 0 : currentTime
         traceRecovery("mpvFallback")
+        Log.player.info(
+            "PLAYBACK_INTENT fallback preserving desired=\(wantsPlayback) pausedGen=\(explicitlyPausedSelectionGeneration ?? -1)"
+        )
         if !isLiveRadio {
             NowPlaying.shared.rememberInterruptedPlayback(position, for: videoId)
         }
