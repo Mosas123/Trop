@@ -10,11 +10,13 @@ on:
       - "Trop/Audio/PlayerController/PlayerController.swift"
       - "Trop/Audio/PlayerController/ApoloFiniteAudioWatchdog.swift"
       - "Trop/Audio/PlayerController/ApoloLiveRadioWatchdog.swift"
+      - "Trop/Audio/PlayerController/AudioRouteChangePolicy.swift"
       - "Trop/Audio/PlayerController/LiveRadioDuplicateRequestPolicy.swift"
       - "Trop/Features/Radio/RadioView.swift"
       - "tests/Playback/ConsolidatedAudioChecks.swift"
       - "tests/Playback/ApoloInterruptionWatchdogChecks.swift"
       - "tests/Playback/LiveRadioDuplicateRequestChecks.swift"
+      - "tests/Playback/AudioRouteChangeChecks.swift"
       - ".github/workflows/consolidated-audio-checks.yml"
 
 jobs:
@@ -50,3 +52,12 @@ jobs:
             tests/Playback/LiveRadioDuplicateRequestChecks.swift \
             -o "$RUNNER_TEMP/live-radio-duplicate-request-checks"
           "$RUNNER_TEMP/live-radio-duplicate-request-checks"
+
+      - name: Check Bluetooth handoff versus headphone disconnect
+        run: |
+          set -euo pipefail
+          swiftc \
+            Trop/Audio/PlayerController/AudioRouteChangePolicy.swift \
+            tests/Playback/AudioRouteChangeChecks.swift \
+            -o "$RUNNER_TEMP/audio-route-change-checks"
+          "$RUNNER_TEMP/audio-route-change-checks"

@@ -94,6 +94,9 @@ final class PlayerController {
     private var wasPlayingBeforeInterruption = false
     private var apoloAudioInterruptionActive = false
     private var apoloLastInterruptionEndedAt: Date?
+    /// Ignore stale route notifications and avoid overriding a newer Play/Pause.
+    private var routeChangeGeneration: UInt64 = 0
+    private var playbackCommandGeneration: UInt64 = 0
     // Diagnostics only. Never used to decide when to resume or fall back.
     private var recoveryID: UInt64 = 0
     private var recoveryBegin: TimeInterval?
@@ -518,14 +521,31 @@ extension PlayerController {
         }
     }
 
-    func setPaused(_ paused: Bool) {
+    func setPaused(_ paused: Bool, forceBackendCommand: Bool = false) {
         if !paused { traceRecovery("playRequested") }
+        playbackCommandGeneration &+= 1
         sharedState.withLock { $0.desiredPlaying = !paused }
         let currentlyPaused = playState.value != .playing
-        guard currentlyPaused != paused else {
+        // A route handoff can pause/stall the renderer without first changing
+        // the UI's optimistic .playing state. Never discard a real Play command.
+        let apoloNeedsResume: Bool
+        if !paused, apoloIsActive {
+            if case .some(.playing) = apoloBackend?.state {
+                apoloNeedsResume = false
+            } else {
+                apoloNeedsResume = true
+            }
+        } else {
+            apoloNeedsResume = false
+        }
+        guard currentlyPaused != paused || forceBackendCommand || apoloNeedsResume else {
             updateNowPlayingProgress()
             return
         }
+        // Restore the session *before* asking AVPlayer/FFmpeg/mpv to resume.
+        // On Bluetooth handoff, the previous ordering could publish Play
+        // while the audio session had not yet been reactivated.
+        if !paused { assertAudioSession(reason: "setPaused") }
         if apoloIsActive {
             if paused { apoloBackend?.pause() } else { apoloBackend?.play() }
         } else {
@@ -541,7 +561,6 @@ extension PlayerController {
             NowPlaying.shared.radioPlaybackStatus = paused
                 ? .paused : (apoloIsActive ? .connecting : .live)
         }
-        if !paused { assertAudioSession(reason: "setPaused") }
         updateNowPlayingProgress()
     }
 
@@ -1323,9 +1342,9 @@ extension PlayerController {
                 }
                 self.traceRecovery("resumeTask")
                 self.assertAudioSession(reason: "legacyInterruptionEnded")
-                if self.playState.value != .playing {
-                    self.setPaused(false)
-                }
+                // An AVPlayer can remain paused after iOS reactivates the
+                // session even when the app's playState still says .playing.
+                self.setPaused(false, forceBackendCommand: true)
                 self.wasPlayingBeforeInterruption = false
             }
         @unknown default:
@@ -1359,8 +1378,59 @@ extension PlayerController {
               let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else { return }
 
         Log.player.info("ROUTE_CHANGE reason=\(reason.rawValue)")
-        if reason == .oldDeviceUnavailable, playState.value == .playing {
-            Task { @MainActor in togglePlayPause() }
+        let event: AudioRouteChangePolicy.Event
+        switch reason {
+        case .newDeviceAvailable:
+            event = .newDeviceAvailable
+        case .oldDeviceUnavailable:
+            event = .oldDeviceUnavailable
+        default:
+            return
+        }
+
+        routeChangeGeneration &+= 1
+        let routeGeneration = routeChangeGeneration
+        let commandGeneration = playbackCommandGeneration
+        let requestSerial = playRequestSerial
+        let selectedID = NowPlaying.shared.videoId
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if case .oldDeviceUnavailable = event {
+                // A headset-to-headset handoff can briefly report the old
+                // output disappearing before the new Bluetooth route settles.
+                // Do not turn that transient gap into a user-requested pause.
+                do { try await Task.sleep(for: .milliseconds(350)) }
+                catch { return }
+            }
+            let sameRequest = self.routeChangeGeneration == routeGeneration
+                && self.playbackCommandGeneration == commandGeneration
+                && self.playRequestSerial == requestSerial
+                && NowPlaying.shared.videoId == selectedID
+            let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+            let builtInOutput = outputs.isEmpty || outputs.allSatisfy {
+                $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver
+            }
+            let action = AudioRouteChangePolicy.action(
+                for: event,
+                desiredPlaying: self.sharedState.withLock { $0.desiredPlaying },
+                isInterrupted: self.apoloAudioInterruptionActive,
+                isCurrentRequest: sameRequest,
+                outputIsBuiltIn: builtInOutput
+            )
+            switch action {
+            case .pause:
+                // Respect privacy when headphones were actually disconnected.
+                self.setPaused(true)
+            case .resume:
+                // A new Bluetooth route should not require selecting a
+                // different radio. Reassert the session and kick the backend.
+                self.setPaused(false, forceBackendCommand: true)
+            case .ignore:
+                break
+            }
+            Log.player.info(
+                "ROUTE_RECOVERY reason=\(reason.rawValue) action=\(String(describing: action)) builtIn=\(builtInOutput) current=\(sameRequest)"
+            )
         }
     }
 }
@@ -1382,6 +1452,7 @@ extension PlayerController {
     func setNowPlayingMetadata() {
         assertAudioSession(reason: "metadata")
         let np = NowPlaying.shared
+        let isLiveRadio = np.playbackKind == .radio
         nowPlayingInfo.removeAll()
 
         let liveDur: Double = apoloIsActive
@@ -1392,7 +1463,7 @@ extension PlayerController {
                 return val
             } ?? 0)
         let duration = liveDur > 0 ? liveDur : np.duration
-        if duration > 0 { np.duration = duration }
+        if !isLiveRadio, duration > 0 { np.duration = duration }
 
         let livePos: Double = apoloIsActive
             ? (apoloBackend?.currentTime ?? 0)
@@ -1409,8 +1480,14 @@ extension PlayerController {
         nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = np.isPlaying ? 1 : 0
         nowPlayingInfo[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
         nowPlayingInfo[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1
-        if duration > 0 { nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = duration }
-        nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsed
+        // Tell iOS this is a true non-seekable live broadcast rather than a
+        // zero-length file. Never publish fake elapsed/duration values for radio.
+        nowPlayingInfo[MPNowPlayingInfoPropertyIsLiveStream] = NSNumber(value: isLiveRadio)
+        if !isLiveRadio {
+            if duration > 0 { nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = duration }
+            nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsed
+        }
+        MPRemoteCommandCenter.shared().changePlaybackPositionCommand.isEnabled = !isLiveRadio
         nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackQueueIndex] = np.queueIndex
         nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackQueueCount] = np.queueSongs.count
         if let image = np.thumbnailUIImage {
@@ -1434,8 +1511,24 @@ extension PlayerController {
     }
 
     func updateNowPlayingProgress() {
+        let np = NowPlaying.shared
+        if np.playbackKind == .radio {
+            // Keep the live marker even across pause, audio route changes and
+            // periodic progress refreshes. Fake 0:00 makes iOS show --:--.
+            var info = nowPlayingInfo
+            info[MPNowPlayingInfoPropertyIsLiveStream] = NSNumber(value: true)
+            info.removeValue(forKey: MPMediaItemPropertyPlaybackDuration)
+            info.removeValue(forKey: MPNowPlayingInfoPropertyElapsedPlaybackTime)
+            info.removeValue(forKey: MPNowPlayingInfoPropertyPlaybackProgress)
+            info[MPNowPlayingInfoPropertyPlaybackRate] = np.isPlaying ? 1 : 0
+            nowPlayingInfo = info
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+            MPNowPlayingInfoCenter.default().playbackState =
+                np.isPlaying ? .playing : .paused
+            return
+        }
         let props: (dur: Double, pos: Double)? = apoloIsActive
-            ? (max(apoloBackend?.duration ?? 0, NowPlaying.shared.duration),
+            ? (max(apoloBackend?.duration ?? 0, np.duration),
                apoloBackend?.currentTime ?? 0)
             : withMpv { mpv in
                 var dur = Double(0)
@@ -1445,20 +1538,6 @@ extension PlayerController {
                 return (dur, pos)
             }
         guard var props else { return }
-        let np = NowPlaying.shared
-        if np.playbackKind == .radio {
-            // Live radio has no finite duration, but pause/lock-screen rate
-            // still needs publishing even when progress cannot be displayed.
-            var info = nowPlayingInfo
-            info.removeValue(forKey: MPMediaItemPropertyPlaybackDuration)
-            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = 0
-            info[MPNowPlayingInfoPropertyPlaybackRate] = np.isPlaying ? 1 : 0
-            nowPlayingInfo = info
-            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
-            MPNowPlayingInfoCenter.default().playbackState =
-                np.isPlaying ? .playing : .paused
-            return
-        }
         guard props.dur > 0 else { return }
 
         if let seek = pendingSeek {
