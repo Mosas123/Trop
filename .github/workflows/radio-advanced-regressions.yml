@@ -1,0 +1,28 @@
+name: Radio Advanced Regression Checks
+
+on:
+  pull_request:
+    paths:
+      - "Trop/Core/Radio/**"
+      - "Trop/Audio/NowPlaying.swift"
+      - "Trop/Features/Radio/RadioView.swift"
+      - "tests/Radio/**"
+      - ".github/workflows/radio-advanced-regressions.yml"
+  workflow_dispatch:
+
+jobs:
+  radio-advanced:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run offline radio transport, parser and identity regression tests
+        run: |
+          set -euo pipefail
+          swiftc \
+            Trop/Core/Radio/RadioBrowser.swift \
+            Trop/Core/Radio/RadioTransportResolver.swift \
+            Trop/Core/Radio/ICYTitleParser.swift \
+            Trop/Core/Radio/RadioMetadataProviders.swift \
+            tests/Radio/RadioAdvancedChecks.swift \
+            -o "$RUNNER_TEMP/radio-advanced-checks"
+          "$RUNNER_TEMP/radio-advanced-checks"

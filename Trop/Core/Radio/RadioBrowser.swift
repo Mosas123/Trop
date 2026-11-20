@@ -12,8 +12,12 @@ struct RadioStation: Identifiable, Hashable, Decodable, Sendable {
     let country: String?
     let codec: String?
     let bitrate: Int?
+    /// Radio Browser's HLS flag (0/1). It is a hint, not proof.
+    let hls: Int?
 
     var id: String { stationuuid }
+
+    var isHLS: Bool { hls == 1 }
 
     /// Direct stream URL, preferring the server-resolved one.
     var streamURL: String? {
@@ -27,6 +31,7 @@ struct RadioStation: Identifiable, Hashable, Decodable, Sendable {
     /// Radio Browser's codec is a hint, not proof of a stream's container.
     /// It helps Apolo choose FFmpeg for opaque Ogg/Opus/FLAC endpoints.
     var apoloMIMEHint: String? {
+        if isHLS { return "application/vnd.apple.mpegurl" }
         let format = (codec ?? "").uppercased()
         if format.contains("OPUS") { return "audio/opus" }
         if format.contains("OGG") || format.contains("VORBIS") {
@@ -73,6 +78,7 @@ struct RadioStation: Identifiable, Hashable, Decodable, Sendable {
         case country
         case codec
         case bitrate
+        case hls
     }
 }
 
