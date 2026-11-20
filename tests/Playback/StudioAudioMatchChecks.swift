@@ -225,6 +225,48 @@ struct StudioAudioMatchChecks {
         }
         precondition(negativeCases >= 100, "Negative fixture coverage regressed")
         print("PASS: \(negativeCases) wrong recording/artist fixtures plus positive checks")
+        // Bug #001: BAILE INoLVIDABLE / video screenshot is not
+        // the album cover, regardless of whether the audio says Lossless.
+        let videoFrame = "https://i.ytimg.com/vi/example/hqdefault.jpg"
+        let albumArt = "https://lh3.googleusercontent.com/example=w120-h120"
+        precondition(MusicArtworkSelectionPolicy.isVideoThumbnail(videoFrame),
+                     "ytimg frames must not be classified as album artwork")
+        precondition(!MusicArtworkSelectionPolicy.isVideoThumbnail(albumArt),
+                     "Music catalogue album-art URLs are not video stills")
+        precondition(MusicArtworkSelectionPolicy.shouldResolveVerifiedCover(
+            thumbnailURL: videoFrame, isVideo: nil, musicVideoType: nil
+        ), "Untyped ytimg thumbnails require a verified album lookup")
+        precondition(MusicArtworkSelectionPolicy.shouldResolveVerifiedCover(
+            thumbnailURL: albumArt, isVideo: true, musicVideoType: "MUSIC_VIDEO_TYPE_OMV"
+        ), "Video-classified selection requires verified art even if the CDN is Music")
+        precondition(!MusicArtworkSelectionPolicy.shouldResolveVerifiedCover(
+            thumbnailURL: albumArt, isVideo: false, musicVideoType: "MUSIC_VIDEO_TYPE_ATV"
+        ), "Verified album audio artwork must not be replaced")
+        precondition(MusicArtworkSelectionPolicy.shouldResolveVerifiedCover(
+            thumbnailURL: nil, isVideo: nil, musicVideoType: nil
+        ), "Missing artwork must still search canonical releases")
+        precondition(MusicArtworkSelectionPolicy.matchesRequestedRelease(
+            requested: "DeBÍ TiRAR MáS FOToS", candidate: "DEBI TIRAR MAS FOTOS"
+        ), "Diacritics/case do not change album identity")
+        precondition(!MusicArtworkSelectionPolicy.matchesRequestedRelease(
+            requested: "DeBÍ TiRAR MáS FOToS", candidate: "Un Verano Sin Ti"
+        ), "A wrong album must never supply player artwork")
+        precondition(!MusicArtworkSelectionPolicy.matchesRequestedRelease(
+            requested: "Un Verano Sin Ti", candidate: "Un Verano Sin Ti (Deluxe)"
+        ), "Alternate release editions may have different artwork")
+        precondition(!MusicArtworkSelectionPolicy.matchesRequestedRelease(
+            requested: "DeBÍ TiRAR MáS FOToS", candidate: nil
+        ), "An unknown release cannot overwrite a known album")
+        precondition(!MusicArtworkSelectionPolicy.acceptableVideoImageSize(
+            width: 120, height: 90
+        ), "Tiny hqdefault previews must not be stretched full-screen")
+        precondition(!MusicArtworkSelectionPolicy.acceptableVideoImageSize(
+            width: 320, height: 180
+        ), "Low-resolution video stills are not large artwork")
+        precondition(MusicArtworkSelectionPolicy.acceptableVideoImageSize(
+            width: 640, height: 480
+        ), "sddefault may be used as a last-resort fallback")
+        print("PASS: 13 verified-album cover, edition and preview-size checks")
         print("PASS: 31 studio album-audio vs music-video matching assertions")
     }
 }

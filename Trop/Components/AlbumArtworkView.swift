@@ -13,12 +13,24 @@ struct SongArtworkView: View {
         "\(song.videoId)|\(song.title)|\(song.artists.map(\.name).joined(separator: ", "))|\(song.album ?? "")|\(song.duration)"
     }
 
+    private var needsVerifiedCover: Bool {
+        MusicArtworkSelectionPolicy.shouldResolveVerifiedCover(
+            thumbnailURL: song.thumbnailUrl,
+            isVideo: song.isVideo,
+            musicVideoType: song.musicVideoType
+        )
+    }
+
     var body: some View {
         GeometryReader { geometry in
-            if let sourceCover = song.thumbnailUrl, !sourceCover.isEmpty {
-                // The selected row's cover is the release identity chosen by
-                // the user. Never swap it for a different catalogue edition.
+            if !needsVerifiedCover, let sourceCover = song.thumbnailUrl,
+               !sourceCover.isEmpty {
+                // Known release art is stable across the row and full player.
                 AsyncImageView(url: sourceCover)
+            } else if resolvedKey == taskKey, let resolvedURL {
+                // Do not allow a still image already cached by NowPlaying to
+                // shadow the newly verified release artwork in this row.
+                AsyncImageView(url: resolvedURL)
             } else if let image = NowPlaying.shared.artwork(for: song.videoId) {
                 Image(uiImage: image)
                     .resizable()
@@ -26,16 +38,15 @@ struct SongArtworkView: View {
                     .frame(width: geometry.size.width, height: geometry.size.height)
                     .clipped()
             } else {
+                // An unverified ytimg/video still is the LAST fallback.
                 AsyncImageView(url: NowPlaying.shared.metadataSnapshot(for: song.videoId)?.artworkURL
-                               ?? (resolvedKey == taskKey ? resolvedURL : nil))
+                               ?? song.thumbnailUrl)
             }
         }
             .task(id: taskKey) {
                 resolvedURL = nil
                 resolvedKey = taskKey
-                // Don't make an external release lookup just to overwrite a
-                // valid selected cover. This also avoids per-row network work.
-                guard song.thumbnailUrl?.isEmpty != false,
+                guard needsVerifiedCover,
                       song.contentKind == nil || song.contentKind == .music,
                       !MusicPlaybackIdentity.isExternal(song.videoId) else { return }
                 let identity = TrackIdentity.make(from: song)
@@ -46,15 +57,26 @@ struct SongArtworkView: View {
                     duration: identity.durationSeconds
                 )
                 guard !Task.isCancelled else { return }
-                var coverURL = metadata?.artworkURL
+                let verified = metadata.flatMap { candidate -> ResolvedMetadata? in
+                    guard TextMatch.recordingsMatch(candidate.title, identity.title),
+                          TextMatch.normalizeArtist(candidate.artist)
+                              == TextMatch.normalizeArtist(identity.artist),
+                          MusicArtworkSelectionPolicy.matchesRequestedRelease(
+                              requested: identity.album, candidate: candidate.album
+                          ) else { return nil }
+                    return candidate
+                }
+                var coverURL = verified?.artworkURL
                 if coverURL == nil, let album = identity.album, !album.isEmpty {
-                    coverURL = await MetadataResolver.albumArtwork(title: album, artist: identity.artist)
+                    coverURL = await MetadataResolver.albumArtwork(
+                        title: album, artist: identity.artist
+                    )
                 }
                 guard !Task.isCancelled else { return }
                 resolvedURL = coverURL?.absoluteString
-                if let metadata {
-                    NowPlaying.shared.acceptResolvedMetadata(metadata, videoId: song.videoId)
-                    onMetadataResolved?(metadata)
+                if let verified {
+                    NowPlaying.shared.acceptResolvedMetadata(verified, videoId: song.videoId)
+                    onMetadataResolved?(verified)
                 }
             }
     }

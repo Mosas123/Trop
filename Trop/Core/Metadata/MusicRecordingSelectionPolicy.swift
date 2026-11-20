@@ -106,3 +106,47 @@ enum MusicRecordingSelectionPolicy {
         return abs(wanted.duration - candidate.duration) <= maxDifference
     }
 }
+
+
+/// Decides when a selected image is a VIDEO preview rather than reliable
+/// music-release artwork. Audio quality and artwork quality are independent:
+/// a lossless stream may be paired with a 120px YouTube frame.
+enum MusicArtworkSelectionPolicy {
+    static func isVideoThumbnail(_ thumbnailURL: String?) -> Bool {
+        guard let thumbnailURL, let url = URL(string: thumbnailURL),
+              let host = url.host?.lowercased() else { return false }
+        return host == "ytimg.com" || host.hasSuffix(".ytimg.com")
+    }
+
+    /// A known official ATV/release image can be rendered immediately.
+    /// Video stills and unknown covers should FIRST try a catalogue-verified
+    /// album cover, but retain the original as fallback when offline.
+    static func shouldResolveVerifiedCover(
+        thumbnailURL: String?,
+        isVideo: Bool?,
+        musicVideoType: String?
+    ) -> Bool {
+        if isVideo == true || MusicRecordingSelectionPolicy.isVideoRecording(musicVideoType) {
+            return true
+        }
+        guard let thumbnailURL, !thumbnailURL.isEmpty else { return true }
+        return isVideoThumbnail(thumbnailURL)
+    }
+
+    static func matchesRequestedRelease(
+        requested: String?,
+        candidate: String?
+    ) -> Bool {
+        guard let requested, !requested.isEmpty else { return true }
+        guard let candidate, !candidate.isEmpty else { return false }
+        // A similarly titled single/compilation must not replace an album.
+        return TextMatch.normalize(requested) == TextMatch.normalize(candidate)
+    }
+
+    static func acceptableVideoImageSize(width: Int, height: Int) -> Bool {
+        // 120x90 and 320x180 frames are inappropriate for large artwork.
+        // Accept hqdefault (480x360) only as a final fallback when neither
+        // maxres nor sddefault exists and no verified cover is available.
+        min(width, height) >= 320
+    }
+}

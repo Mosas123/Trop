@@ -55,8 +55,11 @@ enum MetadataResolver {
         guard let url = components?.url,
               let response: ITunesResponse = try? await decode(url, headers: [:]) else { return nil }
         let match = response.results.first {
-            TextMatch.albumsMatch($0.collectionName ?? "", title)
-                && TextMatch.artistsMatch($0.artistName ?? "", artist)
+            MusicArtworkSelectionPolicy.matchesRequestedRelease(
+                requested: title, candidate: $0.collectionName
+            )
+                && TextMatch.normalizeArtist($0.artistName ?? "")
+                    == TextMatch.normalizeArtist(artist)
         }
         let artwork = ArtworkURLs.highRes(match?.artworkUrl100).flatMap(URL.init(string:))
         let value = artwork.map {

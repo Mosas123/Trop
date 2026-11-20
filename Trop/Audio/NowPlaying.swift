@@ -897,12 +897,13 @@ final class NowPlaying {
         // Safety net: callers that resolve without song metadata pass nil.
         // The queue usually still knows this track's artwork — use it rather
         // than falling back to the low-res ytimg default.
+        let selectedSong = queueSongs.first { $0.videoId == videoId }
         var thumb = thumbnailUrl
         if thumb == nil {
-            thumb = queueSongs.first { $0.videoId == videoId }?.thumbnailUrl
+            thumb = selectedSong?.thumbnailUrl
         }
 
-        let kind = queueSongs.first { $0.videoId == videoId }?.contentKind
+        let kind = selectedSong?.contentKind
         let isPodcast = kind == .episode || kind == .podcast
         let isMusic = !isPodcast
             && playbackKind != .radio
@@ -917,16 +918,27 @@ final class NowPlaying {
             }
             guard !Task.isCancelled, lastLoadedVideoId == videoId else { return }
             if isMusic {
-                // The artwork selected in Album / Quick Picks is the UI's
-                // trusted source. A cross-catalogue best guess must not
-                // replace it with a video thumbnail or another release.
-                // Resize the SAME CDN image when supported, never switch
-                // to the YouTube video's maxres/hqdefault variants.
+                // Album art and video frame thumbnails are NOT interchangeable.
+                // A YouTube still (or a video-classified row) is not proof
+                // of an album cover, even if the AUDIO stream is FLAC.
                 if let thumb, !thumb.isEmpty {
+                    let needsVerifiedCover = MusicArtworkSelectionPolicy.shouldResolveVerifiedCover(
+                        thumbnailURL: thumb,
+                        isVideo: selectedSong?.isVideo,
+                        musicVideoType: selectedSong?.musicVideoType
+                    )
+                    if needsVerifiedCover {
+                        let resolved = await resolveCanonicalArtwork(videoId: videoId)
+                        guard !Task.isCancelled, lastLoadedVideoId == videoId else { return }
+                        if resolved { return }
+                    }
+                    // Keep verified release art when available. For video
+                    // previews, attempt maxres/sd variants before hqdefault;
+                    // never enlarge a tiny original hq frame as the first pick.
                     loadThumbnailFromCDN(
                         videoId: videoId,
                         thumbnailUrl: thumb,
-                        preferSourceArtwork: true
+                        preferSourceArtwork: !MusicArtworkSelectionPolicy.isVideoThumbnail(thumb)
                     )
                     return
                 }
@@ -966,15 +978,18 @@ final class NowPlaying {
             title: title, artist: artist, album: album, duration: duration, seconds: 2.5
         )
         guard !Task.isCancelled, lastLoadedVideoId == videoId else { return false }
-        var coverURL = resolved?.artworkURL
-        if let resolved {
-            guard TextMatch.recordingsMatch(resolved.title, title),
-                  TextMatch.artistsMatch(resolved.artist, artist) else { return false }
+        var coverURL: URL?
+        if let resolved,
+           TextMatch.recordingsMatch(resolved.title, title),
+           TextMatch.normalizeArtist(resolved.artist) == TextMatch.normalizeArtist(artist),
+           MusicArtworkSelectionPolicy.matchesRequestedRelease(
+               requested: album, candidate: resolved.album
+           ) {
+            coverURL = resolved.artworkURL
             acceptResolvedMetadata(resolved, videoId: videoId, replaceExisting: true)
         }
-        // A remaster/live qualifier may prevent a verified track match. Its
-        // known release can still supply artwork, without rewriting recording
-        // metadata or accepting another recording with a similar title.
+        // Do not accept a same-named single/compilation for an album track.
+        // A known release can still supply art without rewriting song text.
         if coverURL == nil, let album, !album.isEmpty {
             coverURL = await MetadataResolver.albumArtwork(title: album, artist: artist)
         }
@@ -983,7 +998,9 @@ final class NowPlaying {
               let artworkURL = URL(string: artworkString),
               let image = try? await ArtworkLoader.image(for: artworkURL) else { return false }
         guard !Task.isCancelled, lastLoadedVideoId == videoId,
-              Self.artworkSide(image) > minimumArtworkSide else { return false }
+              Self.artworkSide(image) >= max(480, minimumArtworkSide + 1) else {
+            return false
+        }
         resolvedArtworkVideoId = videoId
         publishedArtwork = (videoId, artworkURL.absoluteString)
         publishArtwork(image)
@@ -1116,10 +1133,14 @@ final class NowPlaying {
     /// YouTube can return HTTP 200 with a tiny placeholder for an unavailable
     /// maxres image. Skip it so the next actual resolution can be tried.
     private static func isUsableArtwork(_ image: UIImage, for url: URL) -> Bool {
-        guard url.host?.hasSuffix("ytimg.com") == true else { return true }
+        guard MusicArtworkSelectionPolicy.isVideoThumbnail(url.absoluteString) else {
+            return true
+        }
         let width = image.cgImage?.width ?? Int(image.size.width * image.scale)
         let height = image.cgImage?.height ?? Int(image.size.height * image.scale)
-        return width > 120 && height > 90
+        return MusicArtworkSelectionPolicy.acceptableVideoImageSize(
+            width: width, height: height
+        )
     }
 
     private static func artworkSide(_ image: UIImage) -> CGFloat {
