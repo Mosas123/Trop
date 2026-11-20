@@ -109,7 +109,7 @@ struct MiniPlayerBarView: View {
     }
 
     private func preloadLyrics() {
-        guard let id = np.videoId else { return }
+        guard np.playbackKind == .music, let id = np.videoId else { return }
         let upcoming = np.upcomingSongs(prefixLimit: 3).map(\.videoId)
         Task { await LyricsService.shared.preload(videoId: id, upcoming: upcoming) }
     }

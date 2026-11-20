@@ -185,7 +185,8 @@ struct FullPlayerView: View {
                         SecondaryActionsRow(
                             showQueue: $showQueue,
                             isRepeatOn: $np.isRepeatOn,
-                            showLyrics: $showLyrics
+                            showLyrics: np.playbackKind == .radio ? nil : $showLyrics,
+                            showsQueueAction: np.playbackKind != .radio
                         )
                         .scaleEffect(isCompact ? 0.92 : 1)
 
@@ -445,14 +446,14 @@ struct FullPlayerView: View {
     // MARK: - Player Content
 
     private func preloadLyrics() {
-        guard settings.lyricsEnabled else { return }
+        guard settings.lyricsEnabled, np.playbackKind == .music else { return }
         guard let id = np.videoId else { return }
         let upcoming = np.upcomingSongs(prefixLimit: 3).map(\.videoId)
         Task { await LyricsService.shared.preload(videoId: id, upcoming: upcoming) }
     }
 
     private func loadCurrentLyrics() async {
-        guard settings.lyricsEnabled else {
+        guard settings.lyricsEnabled, np.playbackKind == .music else {
             currentLyrics = []
             return
         }

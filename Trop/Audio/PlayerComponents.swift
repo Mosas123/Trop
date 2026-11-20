@@ -142,6 +142,7 @@ struct SecondaryActionsRow: View {
     @Binding var isRepeatOn: Bool
     /// Present only where a lyrics button makes sense (the full player).
     var showLyrics: Binding<Bool>? = nil
+    var showsQueueAction = true
 
     var body: some View {
         HStack(spacing: 0) {
@@ -170,11 +171,12 @@ struct SecondaryActionsRow: View {
             // One full-size, unambiguous Queue target. Repeat stays in
             // QueueView's playback pills; a tiny overlapping repeat button
             // used to toggle accidentally when opening the queue.
-            Button {
-                showQueue.toggle()
-                if showQueue { showLyrics?.wrappedValue = false }
-            } label: {
-                Image(systemName: "list.bullet")
+            if showsQueueAction {
+                Button {
+                    showQueue.toggle()
+                    if showQueue { showLyrics?.wrappedValue = false }
+                } label: {
+                    Image(systemName: "list.bullet")
                     .font(.title3)
                     .foregroundStyle(showQueue ? .white : .white.opacity(0.7))
                     .padding(10)
@@ -187,8 +189,9 @@ struct SecondaryActionsRow: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Queue")
-            .accessibilityHint("Show upcoming songs and repeat controls")
-            .frame(maxWidth: .infinity)
+                .accessibilityHint("Show upcoming songs and repeat controls")
+                .frame(maxWidth: .infinity)
+            }
         }
         .padding(.vertical, 16)
     }
