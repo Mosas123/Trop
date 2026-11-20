@@ -95,6 +95,48 @@ struct AudioRouteChangeChecks {
                      "Without an active playback ID do not resume")
         checks += 1
 
+        // iOS 27.3 beta: AirPods removal -> privacy pause -> legacy
+        // interruption began, but .ended may never be delivered. Only a
+        // real Play from the matching selection can request reactivation.
+        let manual = HeadphoneUnplugManualPlayPermit(
+            playbackID: "song:track-a",
+            playbackGeneration: 42,
+            routeGeneration: 7
+        )
+        func canManuallyRecover(
+            id: String? = "song:track-a",
+            generation: Int = 42,
+            routeGeneration: UInt64 = 7,
+            userCommand: Bool = true,
+            builtIn: Bool = true
+        ) -> Bool {
+            manual.permitsExplicitPlay(
+                playbackID: id,
+                playbackGeneration: generation,
+                routeGeneration: routeGeneration,
+                isUserCommand: userCommand,
+                outputIsBuiltIn: builtIn
+            )
+        }
+        precondition(canManuallyRecover(),
+                     "A real user Play may retry activation after unplug")
+        checks += 1
+        precondition(!canManuallyRecover(userCommand: false),
+                     "A route callback cannot auto-play through the speaker")
+        checks += 1
+        precondition(!canManuallyRecover(builtIn: false),
+                     "Never use old speaker permit after external rerouting")
+        checks += 1
+        precondition(!canManuallyRecover(id: "song:track-b"),
+                     "Changed track invalidates stale manual resume")
+        checks += 1
+        precondition(!canManuallyRecover(generation: 43),
+                     "Changed playback generation invalidates manual resume")
+        checks += 1
+        precondition(!canManuallyRecover(routeGeneration: 8),
+                     "Changed route invalidates manual speaker resume")
+        checks += 1
+
         print("PASS: \(checks) Bluetooth route-change recovery checks")
     }
 }

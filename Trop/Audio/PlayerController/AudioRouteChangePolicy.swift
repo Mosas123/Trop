@@ -59,3 +59,25 @@ enum AudioRouteChangePolicy {
         }
     }
 }
+
+/// Authorization for a **user-initiated** Play after headphones were removed.
+/// A legacy iOS interruption-began event may arrive without an ended event.
+/// Do not use this permit for an automatic route or interruption resume.
+struct HeadphoneUnplugManualPlayPermit: Sendable {
+    let playbackID: String
+    let playbackGeneration: Int
+    let routeGeneration: UInt64
+
+    func permitsExplicitPlay(
+        playbackID: String?,
+        playbackGeneration: Int,
+        routeGeneration: UInt64,
+        isUserCommand: Bool,
+        outputIsBuiltIn: Bool
+    ) -> Bool {
+        isUserCommand && outputIsBuiltIn
+            && self.playbackID == playbackID
+            && self.playbackGeneration == playbackGeneration
+            && self.routeGeneration == routeGeneration
+    }
+}

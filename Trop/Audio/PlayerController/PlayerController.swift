@@ -97,6 +97,10 @@ final class PlayerController {
     /// this selection after the foreground is active or a fresh user Play.
     private var pendingAudioSessionResume: (id: String?, generation: Int)?
     private var headsetHandoffIntent: AudioRouteHandoffIntent?
+    /// Route-bound permission for an explicit user Play if iOS sends an
+    /// interruption begin on unplug but never sends the matching end.
+    /// Never authorizes automatic speaker playback.
+    private var unplugManualPlayPermit: HeadphoneUnplugManualPlayPermit?
     private var apoloAudioInterruptionActive = false
     private var apoloLastInterruptionEndedAt: Date?
     /// Ignore stale route notifications and avoid overriding a newer Play/Pause.
@@ -629,12 +633,49 @@ extension PlayerController {
         if !paused { traceRecovery("playRequested") }
         playbackCommandGeneration &+= 1
         sharedState.withLock { $0.desiredPlaying = !paused }
+        var explicitUnplugRecovered = false
         if !paused && apoloAudioInterruptionActive {
-            // iOS still owns the audio session. Remember Play but do not
-            // announce playback or command Apolo/AVPlayer/mpv prematurely.
-            wasPlayingBeforeInterruption = true
-            traceRecovery("playDeferredUntilInterruptionEnds")
-            return
+            // The old interruption API does not guarantee a matching .ended
+            // callback. Only a genuine user Play after a verified headset
+            // removal may attempt to re-activate on the built-in speaker.
+            // No route notification or delayed auto-resume can take this path.
+            let session = AVAudioSession.sharedInstance()
+            let outputs = session.currentRoute.outputs
+            let builtIn = outputs.isEmpty || outputs.allSatisfy {
+                $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver
+            }
+            let authorized = unplugManualPlayPermit?.permitsExplicitPlay(
+                playbackID: NowPlaying.shared.videoId,
+                playbackGeneration: NowPlaying.shared.playbackGeneration,
+                routeGeneration: routeChangeGeneration,
+                isUserCommand: !systemRecovery,
+                outputIsBuiltIn: builtIn
+            ) ?? false
+
+            guard authorized else {
+                wasPlayingBeforeInterruption = true
+                traceRecovery("playDeferredUntilInterruptionEnds")
+                return
+            }
+            // Explicit Play is a request to reactivate, not proof that the
+            // interruption is over. If iOS rejects activation, retain the
+            // interrupted state and do NOT send optimistic Play to a backend.
+            guard assertAudioSession(reason: "explicitPlayAfterUnplug") else {
+                traceRecovery("unplugManualPlay.activationDenied")
+                return
+            }
+            apoloAudioInterruptionActive = false
+            apoloLastInterruptionEndedAt = Date()
+            recoveryEnd = ProcessInfo.processInfo.systemUptime
+            recoveryPositionAtEnd = apoloIsActive ? apoloBackend?.currentTime : nil
+            wasPlayingBeforeInterruption = false
+            interruptedPlaybackIdentity = nil
+            unplugManualPlayPermit = nil
+            explicitUnplugRecovered = true
+            traceRecovery("unplugManualPlay.activationGranted")
+            Log.player.info(
+                "ROUTE_RECOVERY manualPlay activation=success builtIn=true current=true"
+            )
         }
         let currentlyPaused = playState.value != .playing
         // A route handoff can pause/stall the renderer without first changing
@@ -649,14 +690,15 @@ extension PlayerController {
         } else {
             apoloNeedsResume = false
         }
-        guard currentlyPaused != paused || forceBackendCommand || apoloNeedsResume else {
+        guard currentlyPaused != paused || forceBackendCommand
+                || apoloNeedsResume || explicitUnplugRecovered else {
             updateNowPlayingProgress()
             return
         }
         // Never command a backend or publish an optimistic Play after iOS
         // denied nonmixable audio activation (for example Apple Music !int).
         // Keep the user's desiredPlaying intent for a safe foreground retry.
-        if !paused {
+        if !paused && !explicitUnplugRecovered {
             guard assertAudioSession(reason: "setPaused") else {
                 pendingAudioSessionResume = (
                     id: NowPlaying.shared.videoId,
@@ -1579,9 +1621,24 @@ extension PlayerController {
 
         routeChangeGeneration &+= 1
         let routeGeneration = routeChangeGeneration
+        if case .newDeviceAvailable = event {
+            // A new output invalidates any permit to resume on the speaker.
+            unplugManualPlayPermit = nil
+        }
         let commandGeneration = playbackCommandGeneration
         let requestSerial = playRequestSerial
         let selectedID = NowPlaying.shared.videoId
+        if case .oldDeviceUnavailable = event, let selectedID {
+            // Record before the 350ms route-settling delay: iOS can deliver
+            // interruption.began and the user can press Play during that gap.
+            // The permit alone never plays audio. Every use rechecks output,
+            // route generation, track identity and user initiation.
+            unplugManualPlayPermit = HeadphoneUnplugManualPlayPermit(
+                playbackID: selectedID,
+                playbackGeneration: NowPlaying.shared.playbackGeneration,
+                routeGeneration: routeGeneration
+            )
+        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             if case .oldDeviceUnavailable = event {
@@ -1629,9 +1686,10 @@ extension PlayerController {
             )
             switch action {
             case .pause:
-                // Do not convert the automatic privacy pause into user Pause.
+                // This is a privacy pause, not an explicit user Pause.
                 self.setPaused(true, systemRecovery: true)
             case .resume:
+                self.unplugManualPlayPermit = nil
                 self.headsetHandoffIntent = nil
                 self.setPaused(false, forceBackendCommand: true, systemRecovery: true)
             case .ignore:
