@@ -75,3 +75,25 @@ enum PlaybackEndEvidence {
         return missing >= 8 && missing / expectedDuration >= 0.05
     }
 }
+
+
+/// A deferred Play belongs to the interrupted selection, not to whichever
+/// track happens to be current when iOS eventually allows session activation.
+/// Explicit Pause, a changed selection, or another active interruption wins.
+enum AudioSessionResumePolicy {
+    static func shouldRetry(
+        pendingVideoId: String?,
+        pendingGeneration: Int,
+        currentVideoId: String?,
+        currentGeneration: Int,
+        desiredPlaying: Bool,
+        interruptionActive: Bool,
+        explicitlyPaused: Bool
+    ) -> Bool {
+        pendingVideoId == currentVideoId
+            && pendingGeneration == currentGeneration
+            && desiredPlaying
+            && !interruptionActive
+            && !explicitlyPaused
+    }
+}

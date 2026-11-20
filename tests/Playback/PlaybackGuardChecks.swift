@@ -190,6 +190,46 @@ struct PlaybackGuardChecks {
             decoderPosition: 192,
             expectedDuration: 200
         ), "At least 5 percent difference is also required")
+        // Apple Music -> Trop: an unsuccessful AVAudioSession activation
+        // leaves Play deferred; only the same generation's live intent may
+        // retry when the app becomes active. Explicit Pause always wins.
+        func canRetrySession(
+            pendingID: String? = "KETU",
+            pendingGeneration: Int = 4,
+            currentID: String? = "KETU",
+            currentGeneration: Int = 4,
+            desired: Bool = true,
+            interrupted: Bool = false,
+            explicitlyPaused: Bool = false
+        ) -> Bool {
+            AudioSessionResumePolicy.shouldRetry(
+                pendingVideoId: pendingID,
+                pendingGeneration: pendingGeneration,
+                currentVideoId: currentID,
+                currentGeneration: currentGeneration,
+                desiredPlaying: desired,
+                interruptionActive: interrupted,
+                explicitlyPaused: explicitlyPaused
+            )
+        }
+        precondition(canRetrySession(),
+                     "Foreground may retry a denied Play for same selection")
+        precondition(!canRetrySession(desired: false),
+                     "Explicit Pause revokes delayed background Play")
+        precondition(!canRetrySession(explicitlyPaused: true),
+                     "Selection-scoped pause cannot be overridden by activation")
+        precondition(!canRetrySession(interrupted: true),
+                     "Never resume while iOS interruption remains active")
+        precondition(!canRetrySession(currentID: "BOKeTE"),
+                     "Old song's pending resume must not start the next song")
+        precondition(!canRetrySession(currentGeneration: 5),
+                     "ABA transition cannot revive older session resume")
+        precondition(canRetrySession(pendingID: nil, currentID: nil),
+                     "Podcast/radio selections may have nil identity")
+        precondition(!canRetrySession(pendingID: "KETU", currentID: nil),
+                     "Pending ID must match current source identity")
+        print("PASS: 8 audio-session activation and deferred-resume checks")
+
         print("PASS: 8 early-EOF evidence classification regression checks")
 
         print("PASS: 6 real finite-audio watchdog pause/resume/timeout checks")

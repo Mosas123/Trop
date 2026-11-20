@@ -93,6 +93,9 @@ final class PlayerController {
     private var pendingMetadata: PendingMetadata?
     private var wasPlayingBeforeInterruption = false
     private var interruptedPlaybackIdentity: (id: String?, generation: Int)?
+    /// An iOS-denied activation must not become a fake Play. Retry only for
+    /// this selection after the foreground is active or a fresh user Play.
+    private var pendingAudioSessionResume: (id: String?, generation: Int)?
     private var headsetHandoffIntent: AudioRouteHandoffIntent?
     private var apoloAudioInterruptionActive = false
     private var apoloLastInterruptionEndedAt: Date?
@@ -113,6 +116,11 @@ final class PlayerController {
     var isExplicitlyPausedForCurrentSelection: Bool {
         userPauseGeneration(for: NowPlaying.shared.videoId)
             == NowPlaying.shared.playbackGeneration
+    }
+    private var isAudioSessionResumePendingForCurrentSelection: Bool {
+        guard let pending = pendingAudioSessionResume else { return false }
+        return pending.id == NowPlaying.shared.videoId
+            && pending.generation == NowPlaying.shared.playbackGeneration
     }
     func wantsPlaybackForSelection(videoId: String) -> Bool {
         PlaybackPausePolicy.shouldPlay(
@@ -612,6 +620,7 @@ extension PlayerController {
             if paused {
                 wasPlayingBeforeInterruption = false
                 headsetHandoffIntent = nil
+                pendingAudioSessionResume = nil
             }
             Log.player.info(
                 "PLAYBACK_INTENT userCommand=\(paused ? "pause" : "play") gen=\(NowPlaying.shared.playbackGeneration)"
@@ -644,10 +653,35 @@ extension PlayerController {
             updateNowPlayingProgress()
             return
         }
-        // Restore the session *before* asking AVPlayer/FFmpeg/mpv to resume.
-        // On Bluetooth handoff, the previous ordering could publish Play
-        // while the audio session had not yet been reactivated.
-        if !paused { assertAudioSession(reason: "setPaused") }
+        // Never command a backend or publish an optimistic Play after iOS
+        // denied nonmixable audio activation (for example Apple Music !int).
+        // Keep the user's desiredPlaying intent for a safe foreground retry.
+        if !paused {
+            guard assertAudioSession(reason: "setPaused") else {
+                pendingAudioSessionResume = (
+                    id: NowPlaying.shared.videoId,
+                    generation: NowPlaying.shared.playbackGeneration
+                )
+                if apoloIsActive {
+                    apoloBackend?.pause()
+                } else {
+                    withMpv { mpv in
+                        var flag: Int32 = 1
+                        mpv_set_property(mpv, "pause", MPV_FORMAT_FLAG, &flag)
+                    }
+                }
+                playState.send(.paused)
+                NowPlaying.shared.isPlaying = false
+                traceRecovery("resumeDeferred.activationFailed")
+                Log.player.warning(
+                    "AUDIO_RECOVERY deferredPlay activationDenied "
+                        + "gen=\(NowPlaying.shared.playbackGeneration)"
+                )
+                updateNowPlayingProgress()
+                return
+            }
+            pendingAudioSessionResume = nil
+        }
         if apoloIsActive {
             if paused { apoloBackend?.pause() } else { apoloBackend?.play() }
         } else {
@@ -1354,7 +1388,8 @@ extension PlayerController {
         Log.player.info("AUDIO_RECOVERY id=\(self.recoveryID) event=\(event) uptimeMs=\(uptimeMs) sinceBeginMs=\(elapsed) sinceEndMs=\(postEnd)")
     }
 
-    func assertAudioSession(reason: String = "unspecified") {
+    @discardableResult
+    func assertAudioSession(reason: String = "unspecified") -> Bool {
         let session = AVAudioSession.sharedInstance()
         let start = ProcessInfo.processInfo.systemUptime
         var stage = "category"
@@ -1370,6 +1405,7 @@ extension PlayerController {
             let uptimeMs = Int(ProcessInfo.processInfo.systemUptime * 1000)
             Log.player.info("AUDIO_SESSION_ACTIVATION reason=\(reason) result=success ms=\(ms) uptimeMs=\(uptimeMs)")
             traceRecovery("activation.success.\(reason)")
+            return true
         } catch {
             let ms = Int((ProcessInfo.processInfo.systemUptime - start) * 1000)
             let code = (error as NSError).code
@@ -1377,7 +1413,31 @@ extension PlayerController {
             Log.player.error("AUDIO_SESSION_ACTIVATION reason=\(reason) result=failed stage=\(stage) code=\(code) ms=\(ms) uptimeMs=\(uptimeMs)")
             traceRecovery("activation.failed.\(reason)")
             Log.player.error("Failed to assert audio session: \(error)")
+            return false
         }
+    }
+
+    private func retryDeferredAudioSessionResume(reason: String) {
+        guard let pending = pendingAudioSessionResume else { return }
+        // Another interruption can arrive before UIApplication becomes active.
+        // Preserve the pending intent rather than dropping it.
+        guard !apoloAudioInterruptionActive else { return }
+        let shouldRetry = AudioSessionResumePolicy.shouldRetry(
+            pendingVideoId: pending.id,
+            pendingGeneration: pending.generation,
+            currentVideoId: NowPlaying.shared.videoId,
+            currentGeneration: NowPlaying.shared.playbackGeneration,
+            desiredPlaying: wantsPlayback,
+            interruptionActive: apoloAudioInterruptionActive,
+            explicitlyPaused: isExplicitlyPausedForCurrentSelection
+        )
+        guard shouldRetry else {
+            pendingAudioSessionResume = nil
+            traceRecovery("deferredResumeDropped")
+            return
+        }
+        traceRecovery("deferredResumeRetry.\(reason)")
+        setPaused(false, forceBackendCommand: true, systemRecovery: true)
     }
 
     private func observeInterruptions() {
@@ -1412,6 +1472,7 @@ extension PlayerController {
             recoveryAdvanced = false
             recoveryObservedState = nil
             apoloAudioInterruptionActive = true
+            pendingAudioSessionResume = nil
             interruptedPlaybackIdentity = (
                 id: NowPlaying.shared.videoId,
                 generation: NowPlaying.shared.playbackGeneration
@@ -1469,9 +1530,8 @@ extension PlayerController {
                     return
                 }
                 self.traceRecovery("resumeTask")
-                self.assertAudioSession(reason: "legacyInterruptionEnded")
-                // Explicit Play during interruption and a verified headphone
-                // handoff both require a real backend resume, not just UI state.
+                // setPaused() activates the session and defers the resume if
+                // iOS still refuses it. Do not activate twice or fake Play.
                 self.headsetHandoffIntent = nil
                 self.wasPlayingBeforeInterruption = false
                 self.setPaused(false, forceBackendCommand: true, systemRecovery: true)
@@ -1824,7 +1884,11 @@ extension PlayerController {
             object: nil, queue: .main
         ) { [weak self] _ in
             Log.player.info("AUDIO_RECOVERY_APP didBecomeActive uptimeMs=\(Int(ProcessInfo.processInfo.systemUptime * 1000))")
-            Task { @MainActor [weak self] in self?.traceRecovery("appActive") }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.traceRecovery("appActive")
+                self.retryDeferredAudioSessionResume(reason: "didBecomeActive")
+            }
         }
     }
 }
@@ -2203,7 +2267,8 @@ extension PlayerController {
                                 + "mediaDuration=\(String(format: "%.3f", backend.duration))"
                         )
                     }
-                    if self.playState.value != .playing {
+                    if self.playState.value != .playing,
+                       !self.isAudioSessionResumePendingForCurrentSelection {
                         self.playState.send(.playing)
                         NowPlaying.shared.isPlaying = true
                     }
