@@ -101,7 +101,8 @@ struct AudioRouteChangeChecks {
         let manual = HeadphoneUnplugManualPlayPermit(
             playbackID: "song:track-a",
             playbackGeneration: 42,
-            routeGeneration: 7
+            routeGeneration: 7,
+            expectsBuiltInOutput: true
         )
         func canManuallyRecover(
             id: String? = "song:track-a",
@@ -135,6 +136,61 @@ struct AudioRouteChangeChecks {
         checks += 1
         precondition(!canManuallyRecover(routeGeneration: 8),
                      "Changed route invalidates manual speaker resume")
+        checks += 1
+
+        // iOS 27.3 real-device: removal without putting AirPods in their
+        // case -> route #2, legacy interruption begins, route #1 appears
+        // again, but the interruption-ended notification never arrives.
+        // Only the next explicit Play on that new external output may ask
+        // iOS to activate. Do not automatically play on device reconnection.
+        let reconnected = manual.transferredToExternalRoute(generation: 8)
+        func canPlayOnReconnectedAirPods(
+            id: String? = "song:track-a",
+            generation: Int = 42,
+            routeGeneration: UInt64 = 8,
+            userCommand: Bool = true,
+            builtIn: Bool = false
+        ) -> Bool {
+            reconnected.permitsExplicitPlay(
+                playbackID: id,
+                playbackGeneration: generation,
+                routeGeneration: routeGeneration,
+                isUserCommand: userCommand,
+                outputIsBuiltIn: builtIn
+            )
+        }
+        precondition(canPlayOnReconnectedAirPods(),
+                     "Explicit Play must be allowed on reconnected AirPods")
+        checks += 1
+        precondition(!canPlayOnReconnectedAirPods(userCommand: false),
+                     "Bluetooth reconnection cannot auto-play")
+        checks += 1
+        precondition(!canPlayOnReconnectedAirPods(builtIn: true),
+                     "New external permit must not play on phone speaker")
+        checks += 1
+        precondition(!canPlayOnReconnectedAirPods(routeGeneration: 7),
+                     "Previous speaker route cannot reuse the new permit")
+        checks += 1
+        precondition(!canPlayOnReconnectedAirPods(routeGeneration: 9),
+                     "A subsequent route change invalidates the permit")
+        checks += 1
+        precondition(!canPlayOnReconnectedAirPods(id: "song:track-b"),
+                     "Selecting another track invalidates the manual permit")
+        checks += 1
+        precondition(!canPlayOnReconnectedAirPods(generation: 43),
+                     "Playback generation must match after reconnection")
+        checks += 1
+        let unplugAgain = reconnected.transferredToExternalRoute(generation: 9)
+        precondition(
+            unplugAgain.permitsExplicitPlay(
+                playbackID: "song:track-a",
+                playbackGeneration: 42,
+                routeGeneration: 9,
+                isUserCommand: true,
+                outputIsBuiltIn: false
+            ),
+            "Repeated AirPods flapping must not strand the next manual Play"
+        )
         checks += 1
 
         print("PASS: \(checks) Bluetooth route-change recovery checks")

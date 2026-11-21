@@ -60,13 +60,29 @@ enum AudioRouteChangePolicy {
     }
 }
 
-/// Authorization for a **user-initiated** Play after headphones were removed.
-/// A legacy iOS interruption-began event may arrive without an ended event.
-/// Do not use this permit for an automatic route or interruption resume.
+/// Authorization for a **user-initiated** Play after headphones were
+/// removed. iOS can send another route notification while AirPods remain
+/// outside the case, without ending the original legacy interruption.
+/// The permit is bound to the current route *and output kind*. It never
+/// authorizes automatic route/interruption resumes.
 struct HeadphoneUnplugManualPlayPermit: Sendable {
     let playbackID: String
     let playbackGeneration: Int
     let routeGeneration: UInt64
+    let expectsBuiltInOutput: Bool
+
+    /// Reconnect carries only the right to a later *manual* Play to the
+    /// newly observed external route. It does not itself start playback.
+    func transferredToExternalRoute(
+        generation: UInt64
+    ) -> HeadphoneUnplugManualPlayPermit {
+        HeadphoneUnplugManualPlayPermit(
+            playbackID: playbackID,
+            playbackGeneration: playbackGeneration,
+            routeGeneration: generation,
+            expectsBuiltInOutput: false
+        )
+    }
 
     func permitsExplicitPlay(
         playbackID: String?,
@@ -75,7 +91,7 @@ struct HeadphoneUnplugManualPlayPermit: Sendable {
         isUserCommand: Bool,
         outputIsBuiltIn: Bool
     ) -> Bool {
-        isUserCommand && outputIsBuiltIn
+        isUserCommand && outputIsBuiltIn == expectsBuiltInOutput
             && self.playbackID == playbackID
             && self.playbackGeneration == playbackGeneration
             && self.routeGeneration == routeGeneration

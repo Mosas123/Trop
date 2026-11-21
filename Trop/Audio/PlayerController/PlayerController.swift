@@ -636,9 +636,10 @@ extension PlayerController {
         var explicitUnplugRecovered = false
         if !paused && apoloAudioInterruptionActive {
             // The old interruption API does not guarantee a matching .ended
-            // callback. Only a genuine user Play after a verified headset
-            // removal may attempt to re-activate on the built-in speaker.
-            // No route notification or delayed auto-resume can take this path.
+            // callback. A genuine user Play may try to reactivate only on
+            // the exact output route (speaker or reconnected AirPods) that
+            // followed a verified headphone removal. Automatic recovery and
+            // delayed route callbacks are never allowed through here.
             let session = AVAudioSession.sharedInstance()
             let outputs = session.currentRoute.outputs
             let builtIn = outputs.isEmpty || outputs.allSatisfy {
@@ -671,10 +672,11 @@ extension PlayerController {
             wasPlayingBeforeInterruption = false
             interruptedPlaybackIdentity = nil
             unplugManualPlayPermit = nil
+            headsetHandoffIntent = nil
             explicitUnplugRecovered = true
             traceRecovery("unplugManualPlay.activationGranted")
             Log.player.info(
-                "ROUTE_RECOVERY manualPlay activation=success builtIn=true current=true"
+                "ROUTE_RECOVERY manualPlay activation=success builtIn=\(builtIn) current=true"
             )
         }
         let currentlyPaused = playState.value != .playing
@@ -1622,8 +1624,12 @@ extension PlayerController {
         routeChangeGeneration &+= 1
         let routeGeneration = routeChangeGeneration
         if case .newDeviceAvailable = event {
-            // A new output invalidates any permit to resume on the speaker.
-            unplugManualPlayPermit = nil
+            // AirPods left outside the case may reconnect while the legacy
+            // interruption flag is still set. Carry the existing manual
+            // permit to the NEW route generation, requiring an external
+            // output on the next explicit user Play. Do not auto-resume.
+            unplugManualPlayPermit = unplugManualPlayPermit?
+                .transferredToExternalRoute(generation: routeGeneration)
         }
         let commandGeneration = playbackCommandGeneration
         let requestSerial = playRequestSerial
@@ -1636,7 +1642,8 @@ extension PlayerController {
             unplugManualPlayPermit = HeadphoneUnplugManualPlayPermit(
                 playbackID: selectedID,
                 playbackGeneration: NowPlaying.shared.playbackGeneration,
-                routeGeneration: routeGeneration
+                routeGeneration: routeGeneration,
+                expectsBuiltInOutput: true
             )
         }
         Task { @MainActor [weak self] in
