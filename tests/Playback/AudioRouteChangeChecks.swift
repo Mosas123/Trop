@@ -193,6 +193,92 @@ struct AudioRouteChangeChecks {
         )
         checks += 1
 
+        // iOS 27 video editor reproduction: no headphone route changes,
+        // interruption.began, app returns to foreground with a successful
+        // AVAudioSession activation but no interruption.ended notification.
+        let foreground = ForegroundInterruptionRecoveryPolicy.self
+        precondition(foreground.mayAttemptActivation(
+            isInterrupted: true,
+            isExplicitUserIntent: true,
+            isAppForegroundActive: true,
+            hasCurrentSelection: true,
+            routeChangedSinceInterruption: false
+        ), "A genuine foreground Play may request session reactivation")
+        checks += 1
+        precondition(!foreground.mayAttemptActivation(
+            isInterrupted: true,
+            isExplicitUserIntent: false,
+            isAppForegroundActive: true,
+            hasCurrentSelection: true,
+            routeChangedSinceInterruption: false
+        ), "Foregrounding or metadata activation must never auto-resume")
+        checks += 1
+        precondition(!foreground.mayAttemptActivation(
+            isInterrupted: true,
+            isExplicitUserIntent: true,
+            isAppForegroundActive: false,
+            hasCurrentSelection: true,
+            routeChangedSinceInterruption: false
+        ), "Ordinary background tasks cannot steal another app's audio")
+        checks += 1
+        precondition(!foreground.mayAttemptActivation(
+            isInterrupted: true,
+            isExplicitUserIntent: true,
+            isAppForegroundActive: true,
+            hasCurrentSelection: true,
+            routeChangedSinceInterruption: true
+        ), "A route change must use its separate privacy permit")
+        checks += 1
+        precondition(!foreground.mayAttemptActivation(
+            isInterrupted: true,
+            isExplicitUserIntent: true,
+            isAppForegroundActive: true,
+            hasCurrentSelection: false,
+            routeChangedSinceInterruption: false
+        ), "Cannot reactivate without a selected track")
+        checks += 1
+        precondition(!foreground.mayAttemptActivation(
+            isInterrupted: false,
+            isExplicitUserIntent: true,
+            isAppForegroundActive: true,
+            hasCurrentSelection: true,
+            routeChangedSinceInterruption: false
+        ), "No recovery when already uninterrupted")
+        checks += 1
+
+        // Only a selected track matching the latest generation may unlock
+        // a missing interruption end, never a delayed automatic queue load.
+        precondition(foreground.matchesExplicitSelection(
+            expectedID: "track:3", expectedGeneration: 12,
+            currentID: "track:3", currentGeneration: 12,
+            desiredPlaying: true
+        ), "A fresh deliberate song selection can request session activation")
+        checks += 1
+        precondition(!foreground.matchesExplicitSelection(
+            expectedID: "track:3", expectedGeneration: 12,
+            currentID: "track:4", currentGeneration: 12,
+            desiredPlaying: true
+        ), "A superseded selected track cannot unlock recovery")
+        checks += 1
+        precondition(!foreground.matchesExplicitSelection(
+            expectedID: "track:3", expectedGeneration: 12,
+            currentID: "track:3", currentGeneration: 13,
+            desiredPlaying: true
+        ), "A stale selection generation cannot unlock recovery")
+        checks += 1
+        precondition(!foreground.matchesExplicitSelection(
+            expectedID: nil, expectedGeneration: nil,
+            currentID: "track:3", currentGeneration: 12,
+            desiredPlaying: true
+        ), "Automatic playback without user marker cannot unlock recovery")
+        checks += 1
+        precondition(!foreground.matchesExplicitSelection(
+            expectedID: "track:3", expectedGeneration: 12,
+            currentID: "track:3", currentGeneration: 12,
+            desiredPlaying: false
+        ), "Explicit Pause continues to win during async source loading")
+        checks += 1
+
         print("PASS: \(checks) Bluetooth route-change recovery checks")
     }
 }

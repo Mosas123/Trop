@@ -421,7 +421,7 @@ final class NowPlaying {
             }
         }
         queueIndex += 1
-        playCurrentSong(logContext: "playNext")
+        playCurrentSong(logContext: automatic ? "playNextAutomatic" : "playNext")
     }
 
     func playPrevious() {
@@ -443,6 +443,13 @@ final class NowPlaying {
         guard queueSongs.indices.contains(queueIndex) else { return }
         playbackGeneration += 1
         let intent = playbackGeneration
+        // A genuine Next/Previous/queue tap should recover a stale session.
+        // EOF and repeat-current advances must never do so on their own.
+        if logContext != "playNextAutomatic" && logContext != "repeatCurrent" {
+            PlayerController.shared.markExplicitSelectionForInterruptionRecovery(
+                videoId: queueSongs[queueIndex].videoId, generation: intent
+            )
+        }
         if manageResolvingFlag {
             isResolvingNext = true
         }

@@ -97,3 +97,33 @@ struct HeadphoneUnplugManualPlayPermit: Sendable {
             && self.routeGeneration == routeGeneration
     }
 }
+
+
+/// On iOS 27 the legacy interruption-began notification may have no paired
+/// .ended. Foreground user intent can request a fresh session activation only
+/// when the audio route has stayed stable since the interruption. A changed
+/// route must use the separate headset-removal permit instead.
+enum ForegroundInterruptionRecoveryPolicy {
+    static func mayAttemptActivation(
+        isInterrupted: Bool,
+        isExplicitUserIntent: Bool,
+        isAppForegroundActive: Bool,
+        hasCurrentSelection: Bool,
+        routeChangedSinceInterruption: Bool
+    ) -> Bool {
+        isInterrupted && isExplicitUserIntent && isAppForegroundActive
+            && hasCurrentSelection && !routeChangedSinceInterruption
+    }
+
+    static func matchesExplicitSelection(
+        expectedID: String?,
+        expectedGeneration: Int?,
+        currentID: String?,
+        currentGeneration: Int,
+        desiredPlaying: Bool
+    ) -> Bool {
+        desiredPlaying && expectedID != nil
+            && expectedID == currentID
+            && expectedGeneration == currentGeneration
+    }
+}

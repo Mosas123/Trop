@@ -20,6 +20,9 @@ enum PlaybackQueue {
         let first = songs[index]
         NowPlaying.shared.setQueue(songs, startIndex: index)
         let intent = NowPlaying.shared.playbackGeneration
+        PlayerController.shared.markExplicitSelectionForInterruptionRecovery(
+            videoId: first.videoId, generation: intent
+        )
         loggedTask(log, "\(context) failed") {
             try await PlaybackManager.shared.resolveAndPlay(
                 videoId: first.videoId,
@@ -52,6 +55,9 @@ enum PlaybackQueue {
         if !isCurrentSong {
             NowPlaying.shared.setQueue([song], startIndex: 0)
             let intent = NowPlaying.shared.playbackGeneration
+            PlayerController.shared.markExplicitSelectionForInterruptionRecovery(
+                videoId: song.videoId, generation: intent
+            )
             Task {
                 try? await PlaybackManager.shared.resolveAndPlay(
                     videoId: song.videoId,
@@ -74,6 +80,9 @@ enum PlaybackQueue {
     static func playSingleWithRadio(_ song: SongItem, log: AppLogger) {
         NowPlaying.shared.setQueue([song], startIndex: 0)
         let intent = NowPlaying.shared.playbackGeneration
+        PlayerController.shared.markExplicitSelectionForInterruptionRecovery(
+            videoId: song.videoId, generation: intent
+        )
         Task { @MainActor in
             do {
                 try await PlaybackManager.shared.resolveAndPlay(

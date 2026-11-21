@@ -102,6 +102,12 @@ final class PlayerController {
     /// Never authorizes automatic speaker playback.
     private var unplugManualPlayPermit: HeadphoneUnplugManualPlayPermit?
     private var apoloAudioInterruptionActive = false
+    /// The route at the start of the CURRENT interruption. Without a route
+    /// change, an explicit foreground Play can safely ask iOS to reactivate.
+    private var interruptionRouteGeneration: UInt64?
+    /// Set only by a direct user song-selection entry point, not autoplay,
+    /// queue EOF, delayed loads, or engine fallback.
+    private var explicitRecoverySelection: (id: String, generation: Int)?
     private var apoloLastInterruptionEndedAt: Date?
     /// Ignore stale route notifications and avoid overriding a newer Play/Pause.
     private var routeChangeGeneration: UInt64 = 0
@@ -288,6 +294,16 @@ final class PlayerController {
 // MARK: - Playback
 
 extension PlayerController {
+    /// Called immediately after the user selects a track. The generation
+    /// fences out a delayed resolver or a later automatic queue advance.
+    func markExplicitSelectionForInterruptionRecovery(
+        videoId: String, generation: Int
+    ) {
+        guard apoloAudioInterruptionActive else { return }
+        explicitRecoverySelection = (id: videoId, generation: generation)
+        traceRecovery("explicitTrackSelectionMarked")
+    }
+
     /// Ignore only truly identical, already-playing/connecting radio requests.
     /// This guard precedes all source-load serial and AVPlayer teardown work.
     private func shouldSuppressDuplicateLiveRadioLoad(
@@ -424,6 +440,23 @@ extension PlayerController {
             NowPlaying.shared.videoId = videoId
         }
         guard NowPlaying.shared.videoId == videoId else { return }
+        if ForegroundInterruptionRecoveryPolicy.matchesExplicitSelection(
+            expectedID: explicitRecoverySelection?.id,
+            expectedGeneration: explicitRecoverySelection?.generation,
+            currentID: videoId,
+            currentGeneration: NowPlaying.shared.playbackGeneration,
+            desiredPlaying: wantsPlayback
+        ) {
+            explicitRecoverySelection = nil
+            if apoloAudioInterruptionActive {
+                // A fresh song tap is a user Play intent, not an automatic
+                // interruption resume. Reactivate before the new renderer
+                // is loaded so it doesn't inherit a permanently paused state.
+                _ = attemptExplicitInterruptionActivation(
+                    reason: "explicitTrackSelectionAfterInterruption"
+                )
+            }
+        }
         if headsetHandoffIntent?.playbackID != videoId {
             // A new selection supersedes any old Bluetooth handoff.
             headsetHandoffIntent = nil
@@ -633,51 +666,18 @@ extension PlayerController {
         if !paused { traceRecovery("playRequested") }
         playbackCommandGeneration &+= 1
         sharedState.withLock { $0.desiredPlaying = !paused }
-        var explicitUnplugRecovered = false
-        if !paused && apoloAudioInterruptionActive {
-            // The old interruption API does not guarantee a matching .ended
-            // callback. A genuine user Play may try to reactivate only on
-            // the exact output route (speaker or reconnected AirPods) that
-            // followed a verified headphone removal. Automatic recovery and
-            // delayed route callbacks are never allowed through here.
-            let session = AVAudioSession.sharedInstance()
-            let outputs = session.currentRoute.outputs
-            let builtIn = outputs.isEmpty || outputs.allSatisfy {
-                $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver
-            }
-            let authorized = unplugManualPlayPermit?.permitsExplicitPlay(
-                playbackID: NowPlaying.shared.videoId,
-                playbackGeneration: NowPlaying.shared.playbackGeneration,
-                routeGeneration: routeChangeGeneration,
-                isUserCommand: !systemRecovery,
-                outputIsBuiltIn: builtIn
-            ) ?? false
-
-            guard authorized else {
-                wasPlayingBeforeInterruption = true
-                traceRecovery("playDeferredUntilInterruptionEnds")
-                return
-            }
-            // Explicit Play is a request to reactivate, not proof that the
-            // interruption is over. If iOS rejects activation, retain the
-            // interrupted state and do NOT send optimistic Play to a backend.
-            guard assertAudioSession(reason: "explicitPlayAfterUnplug") else {
-                traceRecovery("unplugManualPlay.activationDenied")
-                return
-            }
-            apoloAudioInterruptionActive = false
-            apoloLastInterruptionEndedAt = Date()
-            recoveryEnd = ProcessInfo.processInfo.systemUptime
-            recoveryPositionAtEnd = apoloIsActive ? apoloBackend?.currentTime : nil
-            wasPlayingBeforeInterruption = false
-            interruptedPlaybackIdentity = nil
-            unplugManualPlayPermit = nil
-            headsetHandoffIntent = nil
-            explicitUnplugRecovered = true
-            traceRecovery("unplugManualPlay.activationGranted")
-            Log.player.info(
-                "ROUTE_RECOVERY manualPlay activation=success builtIn=\(builtIn) current=true"
+        // An explicit user Play can recover a missing legacy .ended callback
+        // when iOS grants a fresh activation. A stable-route interruption
+        // (e.g. video editing) must not depend on any AirPods route permit.
+        let explicitInterruptionRecovered = !paused && !systemRecovery
+            && apoloAudioInterruptionActive
+            && attemptExplicitInterruptionActivation(
+                reason: "explicitForegroundPlayAfterInterruption"
             )
+        if !paused && apoloAudioInterruptionActive {
+            wasPlayingBeforeInterruption = true
+            traceRecovery("playDeferredUntilInterruptionEnds")
+            return
         }
         let currentlyPaused = playState.value != .playing
         // A route handoff can pause/stall the renderer without first changing
@@ -693,14 +693,14 @@ extension PlayerController {
             apoloNeedsResume = false
         }
         guard currentlyPaused != paused || forceBackendCommand
-                || apoloNeedsResume || explicitUnplugRecovered else {
+                || apoloNeedsResume || explicitInterruptionRecovered else {
             updateNowPlayingProgress()
             return
         }
         // Never command a backend or publish an optimistic Play after iOS
         // denied nonmixable audio activation (for example Apple Music !int).
         // Keep the user's desiredPlaying intent for a safe foreground retry.
-        if !paused && !explicitUnplugRecovered {
+        if !paused && !explicitInterruptionRecovered {
             guard assertAudioSession(reason: "setPaused") else {
                 pendingAudioSessionResume = (
                     id: NowPlaying.shared.videoId,
@@ -1461,6 +1461,62 @@ extension PlayerController {
         }
     }
 
+    /// Legacy interruption .ended is not always delivered after another app
+    /// has relinquished audio. This method is called ONLY by direct user
+    /// actions (Play button or explicitly selected new track).
+    /// Session activation must actually succeed before state is cleared.
+    private func attemptExplicitInterruptionActivation(reason: String) -> Bool {
+        guard apoloAudioInterruptionActive else { return false }
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        let outputIsBuiltIn = outputs.isEmpty || outputs.allSatisfy {
+            $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver
+        }
+        let routePermitValid = unplugManualPlayPermit?.permitsExplicitPlay(
+            playbackID: NowPlaying.shared.videoId,
+            playbackGeneration: NowPlaying.shared.playbackGeneration,
+            routeGeneration: routeChangeGeneration,
+            isUserCommand: true,
+            outputIsBuiltIn: outputIsBuiltIn
+        ) ?? false
+        let routeChanged = interruptionRouteGeneration.map {
+            $0 != routeChangeGeneration
+        } ?? true
+        let foregroundPermitValid =
+            ForegroundInterruptionRecoveryPolicy.mayAttemptActivation(
+                isInterrupted: apoloAudioInterruptionActive,
+                isExplicitUserIntent: true,
+                isAppForegroundActive: UIApplication.shared.applicationState == .active,
+                hasCurrentSelection: NowPlaying.shared.videoId != nil,
+                routeChangedSinceInterruption: routeChanged
+            )
+        guard routePermitValid || foregroundPermitValid else {
+            traceRecovery("explicitRecoveryBlocked.routeOrForeground")
+            return false
+        }
+        let activationReason = routePermitValid ? "explicitPlayAfterUnplug" : reason
+        guard assertAudioSession(reason: activationReason) else {
+            // iOS still denies the session. Remain paused; do not fake Play.
+            traceRecovery("explicitRecovery.activationDenied")
+            return false
+        }
+        apoloAudioInterruptionActive = false
+        interruptionRouteGeneration = nil
+        explicitRecoverySelection = nil
+        apoloLastInterruptionEndedAt = Date()
+        recoveryEnd = ProcessInfo.processInfo.systemUptime
+        recoveryPositionAtEnd = apoloIsActive ? apoloBackend?.currentTime : nil
+        wasPlayingBeforeInterruption = false
+        interruptedPlaybackIdentity = nil
+        pendingAudioSessionResume = nil
+        unplugManualPlayPermit = nil
+        headsetHandoffIntent = nil
+        traceRecovery("explicitRecovery.activationGranted")
+        Log.player.info(
+            "AUDIO_RECOVERY explicitPlay activation=success routePermit=\(routePermitValid) builtIn=\(outputIsBuiltIn)"
+        )
+        return true
+    }
+
     private func retryDeferredAudioSessionResume(reason: String) {
         guard let pending = pendingAudioSessionResume else { return }
         // Another interruption can arrive before UIApplication becomes active.
@@ -1516,6 +1572,8 @@ extension PlayerController {
             recoveryAdvanced = false
             recoveryObservedState = nil
             apoloAudioInterruptionActive = true
+            interruptionRouteGeneration = routeChangeGeneration
+            explicitRecoverySelection = nil
             pendingAudioSessionResume = nil
             interruptedPlaybackIdentity = (
                 id: NowPlaying.shared.videoId,
@@ -1527,7 +1585,10 @@ extension PlayerController {
             Log.player.info("AUDIO_INTERRUPTION began")
             wasPlayingBeforeInterruption = sharedState.withLock({ $0.desiredPlaying }) || playState.value == .playing
             if playState.value == .playing {
+                let currentRecoveryID = recoveryID
                 Task { @MainActor in
+                    guard self.apoloAudioInterruptionActive,
+                          self.recoveryID == currentRecoveryID else { return }
                     self.setPaused(true, systemRecovery: true)
                     self.sharedState.withLock { $0.desiredPlaying = self.wasPlayingBeforeInterruption }
                 }
@@ -1537,6 +1598,8 @@ extension PlayerController {
             let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
             let systemAllowsResume = options.contains(.shouldResume) || wasPlayingBeforeInterruption
             apoloAudioInterruptionActive = false
+            interruptionRouteGeneration = nil
+            explicitRecoverySelection = nil
             apoloLastInterruptionEndedAt = Date()
             if recoveryBegin == nil {
                 recoveryID &+= 1
