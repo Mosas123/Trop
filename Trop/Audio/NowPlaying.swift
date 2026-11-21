@@ -18,7 +18,8 @@ struct LiveSongInfo: Equatable {
     var title: String
     var artist: String
     var album: String?
-    var artwork: Data?
+    /// Direct UIKit image reference; never PNG-encode each radio song on the UI actor.
+    var artwork: UIImage?
 }
 
 /// Last known position while a failed network stream is being re-resolved.
@@ -163,6 +164,8 @@ final class NowPlaying {
     private var timer: Timer?
     private var icyTick = 0
     private var progressTick = 0
+    @ObservationIgnored private var lastHeartbeatUptime: TimeInterval?
+    @ObservationIgnored private var lastHeartbeatWasActive = false
     /// Bumped whenever the user starts/changes playback, so deferred autoplay
     /// work can abort instead of hijacking the new track.
     private(set) var playbackGeneration = 0
@@ -177,6 +180,8 @@ final class NowPlaying {
     @ObservationIgnored private var radioMetadataFailures = 0
     @ObservationIgnored private var radioMetadataCooldownUntil: Date?
     @ObservationIgnored private var lastRadioArtworkKey: String?
+    @ObservationIgnored private var radioArtworkRetryKey: String?
+    @ObservationIgnored private var radioArtworkRetryAfter: Date?
     var lastManualSkipTime: Date?
     private var isResolvingNext = false
     private var consecutiveFailures = 0
@@ -549,6 +554,8 @@ final class NowPlaying {
         radioMetadataFailures = 0
         radioMetadataCooldownUntil = nil
         lastRadioArtworkKey = nil
+        radioArtworkRetryKey = nil
+        radioArtworkRetryAfter = nil
         self.radioPlaybackStatus = .connecting
         self.hasVideo = false
         self.isVideoMode = false
@@ -600,6 +607,8 @@ final class NowPlaying {
         radioMetadataFailures = 0
         radioMetadataCooldownUntil = nil
         lastRadioArtworkKey = nil
+        radioArtworkRetryKey = nil
+        radioArtworkRetryAfter = nil
         radioPlaybackStatus = .connecting
         currentSourceName = nil
         currentResult = nil
@@ -1168,6 +1177,8 @@ final class NowPlaying {
 
     /// Publishes a loaded image as the current artwork (cropped square).
     private func publishArtwork(_ image: UIImage) {
+        let radioArtworkStart = playbackKind == .radio
+            ? ProcessInfo.processInfo.systemUptime : nil
         let cropped = image.centerCroppedSquare()
         thumbnailUIImage = cropped
         displayedArtworkVideoId = videoId
@@ -1175,6 +1186,10 @@ final class NowPlaying {
         thumbnailVersion &+= 1
         updateDominantColors(from: cropped)
         PlayerController.shared.updateNowPlayingArtwork()
+        if let radioArtworkStart {
+            let elapsedMs = Int((ProcessInfo.processInfo.systemUptime - radioArtworkStart) * 1000)
+            Log.nowPlaying.info("RADIO_ARTWORK_UI publishMs=\(elapsedMs)")
+        }
     }
 
     /// YouTube can return HTTP 200 with a tiny placeholder for an unavailable
@@ -1195,12 +1210,22 @@ final class NowPlaying {
         return min(image.size.width, image.size.height) * image.scale
     }
 
+    private func mayPublishLoadedThumbnail(for videoId: String) -> Bool {
+        lastLoadedVideoId == videoId
+            && resolvedArtworkVideoId != videoId
+            && RadioBackgroundMetadataPolicy.mayPublishStationArtwork(
+                isRadio: playbackKind == .radio,
+                liveSongHasArtwork: liveSongInfo?.artwork != nil
+            )
+    }
+
     private func loadThumbnailFromCDN(
         videoId: String,
         thumbnailUrl: String? = nil,
         fallbackImage: UIImage? = nil,
         preferSourceArtwork: Bool = false
     ) {
+        guard mayPublishLoadedThumbnail(for: videoId) else { return }
         // Best source first: the track's own artwork upgraded to full
         // resolution, then ytimg step-downs, then the guaranteed hqdefault.
         var candidates: [String] = []
@@ -1261,13 +1286,13 @@ final class NowPlaying {
         }
         Task {
             for url in urls.prefix(fetchCount) {
-                guard lastLoadedVideoId == videoId, resolvedArtworkVideoId != videoId else { return }
+                guard mayPublishLoadedThumbnail(for: videoId) else { return }
                 do {
                     let platformImage = try await ArtworkLoader.image(for: url)
                     guard Self.isUsableArtwork(platformImage, for: url),
                           fallbackImage.map({ Self.artworkSide(platformImage) > Self.artworkSide($0) }) ?? true else { continue }
                     await MainActor.run {
-                        guard self.lastLoadedVideoId == videoId, self.resolvedArtworkVideoId != videoId else { return }
+                        guard self.mayPublishLoadedThumbnail(for: videoId) else { return }
                         self.publishArtwork(platformImage)
                         self.publishedArtwork = (videoId, url.absoluteString)
                     }
@@ -1278,7 +1303,7 @@ final class NowPlaying {
             }
             if paintedIndex == nil {
                 await MainActor.run {
-                    guard self.lastLoadedVideoId == videoId, self.resolvedArtworkVideoId != videoId else { return }
+                    guard self.mayPublishLoadedThumbnail(for: videoId) else { return }
                     if let fallbackImage {
                         publishArtwork(fallbackImage)
                     } else {
@@ -1308,7 +1333,10 @@ final class NowPlaying {
         Log.nowPlaying.debug("TIMER start videoId=\(self.videoId ?? "nil")")
         // Add to `.common` so progress keeps updating while the user scrolls
         // or drags the slider (the default mode pauses the timer).
-        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+        // Live radio has no seekable progress. Poll it once per second rather
+        // than rebuilding observable player state four times per second.
+        let interval: TimeInterval = playbackKind == .radio ? 1.0 : 0.25
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.timerTick()
             }
@@ -1319,7 +1347,25 @@ final class NowPlaying {
 
     @MainActor
     private func timerTick() {
-        currentTime = PlayerController.shared.currentTime
+        // Device-only hang diagnostics: an active-scene delay here indicates
+        // main-actor / run-loop starvation, whereas a smoothly ticking timer
+        // during an unresponsive view points toward SwiftUI presentation.
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let isForeground = UIApplication.shared.applicationState == .active
+        if isForeground, lastHeartbeatWasActive, let lastHeartbeatUptime {
+            let delayMs = Int((uptime - lastHeartbeatUptime) * 1000)
+            if delayMs >= (playbackKind == .radio ? 2_500 : 1_500) {
+                Log.nowPlaying.warning(
+                    "UI_HEARTBEAT_DELAY ms=\(delayMs) " +
+                    "radio=\(playbackKind == .radio) playing=\(isPlaying)"
+                )
+            }
+        }
+        lastHeartbeatUptime = uptime
+        lastHeartbeatWasActive = isForeground
+        if playbackKind != .radio {
+            currentTime = PlayerController.shared.currentTime
+        }
         // `duration` arrives via mpv property events and
         // `updateNowPlayingProgress`; polling it every tick doubled the
         // synchronous mpv reads on the main actor.
@@ -1333,14 +1379,14 @@ final class NowPlaying {
             ]
             UserDefaults.standard.set(payload, forKey: Self.positionKey)
         }
-        if progressTick % 4 == 0 {
+        if playbackKind == .radio || progressTick % 4 == 0 {
             PlayerController.shared.updateNowPlayingProgress()
         }
         if MusicPlaybackIdentity.isYouTube(videoId) {
             SponsorBlockIntegration.shared.tick()
         }
         icyTick += 1
-        if icyTick % 4 == 0, playbackKind == .radio {
+        if playbackKind == .radio {
             refreshLiveTitle()
             refreshRadioMetadataIfNeeded()
         }
@@ -1354,10 +1400,19 @@ final class NowPlaying {
         }
     }
 
+    /// Recheck the active station as the app enters/leaves background audio.
+    /// This uses the existing 30-second provider throttle and never starts playback.
+    func refreshRadioMetadataForCurrentStation() {
+        guard playbackKind == .radio, isPlaying else { return }
+        refreshLiveTitle()
+        refreshRadioMetadataIfNeeded()
+    }
+
     /// Reads the stream's ICY title (the live song on a Shoutcast/Icecast
     /// station) and publishes it when it changes.
     private func refreshLiveTitle() {
-        guard let icy = PlayerController.shared.icyTitle(), !icy.isEmpty else { return }
+        guard isPlaying,
+              let icy = PlayerController.shared.icyTitle(), !icy.isEmpty else { return }
         guard let parsed = ICYTitleParser.parse(icy, stationName: displayTitle) else { return }
         let display = parsed.display
         guard liveTitle != display else { return }
@@ -1372,12 +1427,18 @@ final class NowPlaying {
     /// Broadcasters without ICY (Radio Paradise AAC/MP3, etc.) get their
     /// now-playing data from a per-station API instead.
     private func refreshRadioMetadataIfNeeded() {
-        guard playbackKind == .radio,
-              isPlaying,
-              UIApplication.shared.applicationState == .active,
-              let raw = currentStreamURL,
-              let url = URL(string: raw),
-              let provider = RadioMetadataProviders.provider(for: url, stationName: displayTitle) else {
+        let appState: RadioAppExecutionState
+        switch UIApplication.shared.applicationState {
+        case .active: appState = .active
+        case .background: appState = .background
+        case .inactive: appState = .inactive
+        @unknown default: appState = .inactive
+        }
+        guard RadioBackgroundMetadataPolicy.shouldRefresh(
+            isRadio: playbackKind == .radio, isPlaying: isPlaying, appState: appState
+        ), let raw = currentStreamURL,
+           let url = URL(string: raw),
+           let provider = RadioMetadataProviders.provider(for: url, stationName: displayTitle) else {
             return
         }
         if let until = radioMetadataCooldownUntil, Date() < until { return }
@@ -1401,6 +1462,13 @@ final class NowPlaying {
                           streamURL: self.currentStreamURL
                       ) else { return }
                 if let data {
+                    // A broadcaster API can lag behind the actual ICY stream.
+                    // Never overwrite a more recent in-stream song title.
+                    guard RadioBackgroundMetadataPolicy.acceptsProvider(
+                        data,
+                        currentICYRaw: PlayerController.shared.icyTitle(),
+                        stationName: self.displayTitle
+                    ) else { return }
                     self.radioMetadataFailures = 0
                     self.radioMetadataCooldownUntil = nil
                     self.applyRadioNowPlaying(data)
@@ -1428,6 +1496,8 @@ final class NowPlaying {
             liveTitle = display
             liveSongInfo = LiveSongInfo(title: title, artist: artist, album: data.album, artwork: nil)
             lastRadioArtworkKey = nil
+            radioArtworkRetryKey = nil
+            radioArtworkRetryAfter = nil
             showRadioPlaceholderArtwork()
         } else if liveSongInfo?.album == nil {
             liveSongInfo?.album = data.album
@@ -1435,9 +1505,19 @@ final class NowPlaying {
 
         // Prefer catalogue high-resolution art, but retain the broadcaster's
         // real cover as a fallback. Cancel and verify origin across awaits.
-        let key = "\(artist.lowercased())|\(title.lowercased())"
+        // Treat a newly supplied broadcaster cover as a fresh opportunity
+        // even when a catalogue-only attempt for this song recently failed.
+        let albumKey = data.album?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let coverKey = data.coverURL?.absoluteString ?? ""
+        let key = "\(artist.lowercased())|\(title.lowercased())|\(albumKey)|\(coverKey)"
         if let liveSongInfo, liveSongInfo.artwork != nil { return }
         if lastRadioArtworkKey == key { return }
+        guard RadioBackgroundMetadataPolicy.mayAttemptArtwork(
+            key: key,
+            failedKey: radioArtworkRetryKey,
+            retryAfter: radioArtworkRetryAfter,
+            now: Date()
+        ) else { return }
         lastRadioArtworkKey = key
         radioArtworkTask?.cancel()
         let identity = RadioMetadataIdentity(
@@ -1446,11 +1526,15 @@ final class NowPlaying {
             streamURL: currentStreamURL
         )
         radioArtworkTask = Task { [weak self] in
+            let lookupStart = ProcessInfo.processInfo.systemUptime
             let resolved: ResolvedMetadata?
             if artist.isEmpty {
                 resolved = nil
             } else {
-                resolved = await MetadataResolver.enrich(title: title, artist: artist)
+                // A broadcaster-supplied album disambiguates same-name recordings.
+                resolved = await MetadataResolver.enrich(
+                    title: title, artist: artist, album: data.album
+                )
             }
             guard !Task.isCancelled else { return }
             let preferred = ArtworkURLs.highRes(resolved?.artworkURL?.absoluteString)
@@ -1458,13 +1542,17 @@ final class NowPlaying {
             let providerCover = data.coverURL?.scheme?.lowercased() == "https"
                 ? data.coverURL : nil
             var image: UIImage?
+            var imageSource = "none"
             if let preferred {
                 image = try? await ArtworkLoader.image(for: preferred)
+                if image != nil { imageSource = "catalogue" }
             }
             if image == nil, let providerCover {
                 image = try? await ArtworkLoader.image(for: providerCover)
+                if image != nil { imageSource = "broadcaster" }
             }
             guard !Task.isCancelled else { return }
+            let lookupMs = Int((ProcessInfo.processInfo.systemUptime - lookupStart) * 1000)
             await MainActor.run {
                 guard let self, self.isPlaying, self.playbackKind == .radio,
                       self.liveTitle == display,
@@ -1472,16 +1560,37 @@ final class NowPlaying {
                           generation: self.playbackGeneration,
                           stationID: self.videoId,
                           streamURL: self.currentStreamURL
-                      ) else { return }
+                      ) else {
+                    Log.nowPlaying.debug("RADIO_ARTWORK_RESULT stale lookupMs=\(lookupMs)")
+                    return
+                }
                 if let image {
+                    let processingStart = ProcessInfo.processInfo.systemUptime
                     self.publishArtwork(image)
-                    self.liveSongInfo?.artwork = image.pngData()
+                    // Reuse the cropped UIImage directly. Encoding a potentially
+                    // multi-megabyte PNG here, then decoding it on every SwiftUI
+                    // player redraw, can cause foreground hitches.
+                    self.liveSongInfo?.artwork = self.thumbnailUIImage
                     if let album = resolved?.album, self.liveSongInfo?.album == nil {
                         self.liveSongInfo?.album = album
                     }
+                    let processingMs = Int(
+                        (ProcessInfo.processInfo.systemUptime - processingStart) * 1000
+                    )
+                    Log.nowPlaying.info(
+                        "RADIO_ARTWORK_RESULT found source=\(imageSource) " +
+                        "lookupMs=\(lookupMs) processingMs=\(processingMs) " +
+                        "artworkReady=\(self.liveSongInfo?.artwork != nil)"
+                    )
                 } else if self.lastRadioArtworkKey == key {
                     // Do not permanently suppress a retry when art was missing.
                     self.lastRadioArtworkKey = nil
+                    self.radioArtworkRetryKey = key
+                    self.radioArtworkRetryAfter = Date().addingTimeInterval(60)
+                    Log.nowPlaying.info(
+                        "RADIO_ARTWORK_RESULT missing lookupMs=\(lookupMs) " +
+                        "catalogueURL=\(preferred != nil) providerURL=\(providerCover != nil)"
+                    )
                 }
             }
         }
@@ -1493,7 +1602,9 @@ final class NowPlaying {
         guard playbackKind == .radio else { return }
         thumbnailUIImage = nil
         thumbnailImage = Image(systemName: "dot.radiowaves.left.and.right")
-        PlayerController.shared.updateNowPlayingArtwork()
+        // Update song title/artist/album as well as clearing the old cover.
+        // Never re-activate AVAudioSession just to publish metadata.
+        PlayerController.shared.publishRadioNowPlayingMetadata()
     }
 
     /// Splits a raw ICY stream title into artist and title.
@@ -1507,6 +1618,8 @@ final class NowPlaying {
     private func stopTimer() {
         timer?.invalidate()
         timer = nil
+        lastHeartbeatUptime = nil
+        lastHeartbeatWasActive = false
     }
 
     // MARK: Sleep timer

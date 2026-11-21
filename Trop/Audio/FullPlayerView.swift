@@ -471,7 +471,7 @@ struct FullPlayerView: View {
     private func radioLiveCard(_ live: LiveSongInfo) -> some View {
         HStack(spacing: 10) {
             Group {
-                if let data = live.artwork, let image = UIImage(data: data) {
+                if let image = live.artwork {
                     Image(uiImage: image).resizable().scaledToFill()
                 } else {
                     RoundedRectangle(cornerRadius: 6, style: .continuous)

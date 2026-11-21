@@ -21,6 +21,112 @@ struct RadioNowPlaying: Equatable, Sendable {
     let coverURL: URL?
 }
 
+/// Keep radio metadata current while iOS permits background audio execution.
+/// This never starts playback or asks iOS for extra background runtime.
+enum RadioAppExecutionState: Sendable {
+    case active
+    case background
+    case inactive
+}
+
+struct RadioLockScreenFields: Equatable, Sendable {
+    let title: String
+    let artist: String
+    let album: String
+}
+
+enum RadioBackgroundMetadataPolicy {
+    static func shouldRefresh(
+        isRadio: Bool,
+        isPlaying: Bool,
+        appState: RadioAppExecutionState
+    ) -> Bool {
+        guard isRadio, isPlaying else { return false }
+        switch appState {
+        case .active, .background:
+            return true
+        case .inactive:
+            return false
+        }
+    }
+
+    /// The previous mpv/Apolo stream can still expose an ICY title while a
+    /// replacement station is loading. Never label that title as the new station.
+    static func mayReadICY(
+        isRadio: Bool,
+        selectedStationID: String?,
+        activeStationID: String?,
+        pendingStationID: String?
+    ) -> Bool {
+        isRadio && selectedStationID != nil
+            && selectedStationID == activeStationID && pendingStationID == nil
+    }
+
+    /// Prefer the title embedded in the current live audio over an API response
+    /// for a different track (which may be ahead of or behind the live stream).
+    /// Stations without a usable ICY title continue to use their broadcaster API.
+    static func acceptsProvider(
+        _ provider: RadioNowPlaying,
+        currentICYRaw: String?,
+        stationName: String
+    ) -> Bool {
+        guard let currentICYRaw,
+              let icy = ICYTitleParser.parse(currentICYRaw, stationName: stationName) else {
+            return true
+        }
+        let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        guard icy.title.compare(provider.title, options: options) == .orderedSame else {
+            return false
+        }
+        return icy.artist.isEmpty || provider.artist.isEmpty
+            || icy.artist.compare(provider.artist, options: options) == .orderedSame
+    }
+
+    /// Failed catalogue image lookups must not restart on every 1-second ICY
+    /// poll. A new song or a newly supplied broadcaster URL bypasses cooldown.
+    static func mayAttemptArtwork(
+        key: String,
+        failedKey: String?,
+        retryAfter: Date?,
+        now: Date
+    ) -> Bool {
+        guard key == failedKey, let retryAfter else { return true }
+        return now >= retryAfter
+    }
+
+    /// The station icon can finish downloading after a current-song cover.
+    /// Once song artwork is published, a late station icon must not replace it.
+    static func mayPublishStationArtwork(
+        isRadio: Bool,
+        liveSongHasArtwork: Bool
+    ) -> Bool {
+        !isRadio || !liveSongHasArtwork
+    }
+
+    /// Surface the detected song without losing the station identity.
+    /// A station-only fallback is used when the broadcast has no valid song.
+    static func lockScreenFields(
+        stationTitle: String,
+        stationArtist: String,
+        songTitle: String?,
+        songArtist: String?
+    ) -> RadioLockScreenFields {
+        let station = stationTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stationCredit = stationArtist.trimmingCharacters(in: .whitespacesAndNewlines)
+        let song = songTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard song.count >= 2,
+              song.caseInsensitiveCompare(station) != .orderedSame else {
+            return RadioLockScreenFields(title: station, artist: stationCredit, album: "")
+        }
+        let credit = songArtist?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return RadioLockScreenFields(
+            title: song,
+            artist: credit.isEmpty ? station : credit,
+            album: station
+        )
+    }
+}
+
 protocol RadioMetadataProvider: Sendable {
     func metadata(for streamURL: URL, stationName: String) async -> RadioNowPlaying?
 }

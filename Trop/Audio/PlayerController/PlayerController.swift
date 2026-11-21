@@ -244,8 +244,18 @@ final class PlayerController {
     }
 
     /// Radio titles come from whichever engine actually owns playback.
-    /// Never read a stale mpv ICY property while Apolo plays a station.
+    /// Never read a stale mpv/Apolo ICY title from the preceding station.
     func icyTitle() -> String? {
+        let selectedID = NowPlaying.shared.videoId
+        let (activeID, pendingID) = sharedState.withLock {
+            ($0.currentVideoId, $0.pendingVideoId)
+        }
+        guard RadioBackgroundMetadataPolicy.mayReadICY(
+            isRadio: NowPlaying.shared.playbackKind == .radio,
+            selectedStationID: selectedID,
+            activeStationID: activeID,
+            pendingStationID: pendingID
+        ) else { return nil }
         if apoloIsActive { return apoloBackend?.liveTitle }
         return withMpv { mpv -> String? in
             guard let cstr = mpv_get_property_string(mpv, "icy-title") else { return nil }
@@ -1786,8 +1796,21 @@ extension PlayerController {
         }
     }
 
-    func setNowPlayingMetadata() {
-        assertAudioSession(reason: "metadata")
+    private func radioLockScreenFields(for np: NowPlaying) -> RadioLockScreenFields {
+        RadioBackgroundMetadataPolicy.lockScreenFields(
+            stationTitle: np.displayTitle,
+            stationArtist: np.displayArtist,
+            songTitle: np.liveSongInfo?.title,
+            songArtist: np.liveSongInfo?.artist
+        )
+    }
+
+    func setNowPlayingMetadata(activateSession: Bool = false) {
+        // Metadata publication is not a playback request. Starting a stream
+        // and user Play explicitly activate the session at their own call sites.
+        // Pure metadata refreshes (e.g. background transition) must not steal
+        // audio focus from another app or undo an explicit user Pause.
+        if activateSession { assertAudioSession(reason: "metadata") }
         let np = NowPlaying.shared
         let isLiveRadio = np.playbackKind == .radio
         nowPlayingInfo.removeAll()
@@ -1811,9 +1834,16 @@ extension PlayerController {
             } ?? 0)
         let elapsed = livePos > 0 ? livePos : np.currentTime
 
-        nowPlayingInfo[MPMediaItemPropertyTitle] = np.displayTitle
-        nowPlayingInfo[MPMediaItemPropertyArtist] = np.displayArtist
-        nowPlayingInfo[MPMediaItemPropertyAlbumTitle] = np.displayAlbumTitle
+        if isLiveRadio {
+            let fields = radioLockScreenFields(for: np)
+            nowPlayingInfo[MPMediaItemPropertyTitle] = fields.title
+            nowPlayingInfo[MPMediaItemPropertyArtist] = fields.artist
+            nowPlayingInfo[MPMediaItemPropertyAlbumTitle] = fields.album
+        } else {
+            nowPlayingInfo[MPMediaItemPropertyTitle] = np.displayTitle
+            nowPlayingInfo[MPMediaItemPropertyArtist] = np.displayArtist
+            nowPlayingInfo[MPMediaItemPropertyAlbumTitle] = np.displayAlbumTitle
+        }
         nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = np.isPlaying ? 1 : 0
         nowPlayingInfo[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
         nowPlayingInfo[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1
@@ -1832,10 +1862,43 @@ extension PlayerController {
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
         MPNowPlayingInfoCenter.default().playbackState = np.isPlaying ? .playing : .paused
+        // Log the *actual* Control Center fields. For radio, displayTitle
+        // remains the station name even when a live song is published.
+        let publishedTitle = nowPlayingInfo[MPMediaItemPropertyTitle] as? String ?? ""
+        let publishedArtist = nowPlayingInfo[MPMediaItemPropertyArtist] as? String ?? ""
         Log.player.info(
-            "NOW_PLAYING_PUBLISH title='\(np.displayTitle)' artist='\(np.displayArtist)' " +
+            "NOW_PLAYING_PUBLISH title='\(publishedTitle)' artist='\(publishedArtist)' " +
             "duration=\(duration) rate=\(nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] ?? 0) " +
             "artwork=\(np.thumbnailUIImage != nil) keys=\(nowPlayingInfo.keys.count)"
+        )
+    }
+
+    /// Publish a changed live song in Control Center/lock screen without
+    /// invoking assertAudioSession: metadata must never resume interrupted audio.
+    func publishRadioNowPlayingMetadata() {
+        let np = NowPlaying.shared
+        guard np.playbackKind == .radio else { return }
+        let fields = radioLockScreenFields(for: np)
+        nowPlayingInfo[MPMediaItemPropertyTitle] = fields.title
+        nowPlayingInfo[MPMediaItemPropertyArtist] = fields.artist
+        nowPlayingInfo[MPMediaItemPropertyAlbumTitle] = fields.album
+        nowPlayingInfo[MPNowPlayingInfoPropertyIsLiveStream] = NSNumber(value: true)
+        nowPlayingInfo[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
+        nowPlayingInfo.removeValue(forKey: MPMediaItemPropertyPlaybackDuration)
+        nowPlayingInfo.removeValue(forKey: MPNowPlayingInfoPropertyElapsedPlaybackTime)
+        nowPlayingInfo.removeValue(forKey: MPNowPlayingInfoPropertyPlaybackProgress)
+        nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = np.isPlaying ? 1 : 0
+        if let image = np.thumbnailUIImage {
+            nowPlayingInfo[MPMediaItemPropertyArtwork] = Self.makeArtwork(from: image)
+        } else {
+            nowPlayingInfo.removeValue(forKey: MPMediaItemPropertyArtwork)
+        }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
+        MPNowPlayingInfoCenter.default().playbackState = np.isPlaying ? .playing : .paused
+        Log.player.info(
+            "RADIO_NOW_PLAYING_PUBLISH song=\(np.liveSongInfo != nil) " +
+            "background=\(UIApplication.shared.applicationState == .background) " +
+            "artwork=\(np.thumbnailUIImage != nil)"
         )
     }
 
@@ -1843,8 +1906,16 @@ extension PlayerController {
         let np = NowPlaying.shared
         if let image = np.thumbnailUIImage {
             nowPlayingInfo[MPMediaItemPropertyArtwork] = Self.makeArtwork(from: image)
+        } else {
+            nowPlayingInfo.removeValue(forKey: MPMediaItemPropertyArtwork)
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
+        if np.playbackKind == .radio {
+            Log.player.info(
+                "RADIO_ARTWORK_SYSTEM image=\(np.thumbnailUIImage != nil) " +
+                "songArtwork=\(np.liveSongInfo?.artwork != nil)"
+            )
+        }
     }
 
     func updateNowPlayingProgress() {
@@ -1981,14 +2052,15 @@ extension PlayerController {
                 if self.sharedState.withLock({ $0.desiredPlaying }) {
                     self.assertAudioSession(reason: "didEnterBackground")
                 }
-                self.setNowPlayingMetadata()
+                self.setNowPlayingMetadata(activateSession: false)
                 self.updateNowPlayingProgress()
+                NowPlaying.shared.refreshRadioMetadataForCurrentStation()
             }
             for delaySeconds in [0.6, 3] as [Double] {
                 Task { @MainActor [weak self] in
                     try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
                     guard let self, UIApplication.shared.applicationState != .active else { return }
-                    self.setNowPlayingMetadata()
+                    self.setNowPlayingMetadata(activateSession: false)
                     self.updateNowPlayingProgress()
                 }
             }
@@ -2016,6 +2088,7 @@ extension PlayerController {
                 guard let self else { return }
                 self.traceRecovery("appActive")
                 self.retryDeferredAudioSessionResume(reason: "didBecomeActive")
+                NowPlaying.shared.refreshRadioMetadataForCurrentStation()
             }
         }
     }

@@ -140,6 +140,138 @@ struct RadioAdvancedChecks {
         expect(RadioFranceProvider.nowPlaying(from: wrongPosition) == nil,
                "Out-of-range FIP level must not publish stale metadata")
 
+        // Background audio is allowed to refresh station metadata, but an
+        // inactive transition or paused/unrelated media must not poll.
+        expect(RadioBackgroundMetadataPolicy.shouldRefresh(
+            isRadio: true, isPlaying: true, appState: .active
+        ), "Foreground radio playback polls station metadata")
+        expect(RadioBackgroundMetadataPolicy.shouldRefresh(
+            isRadio: true, isPlaying: true, appState: .background
+        ), "Background audio playback polls station metadata")
+        expect(!RadioBackgroundMetadataPolicy.shouldRefresh(
+            isRadio: true, isPlaying: true, appState: .inactive
+        ), "Transient inactive app does not initiate a network refresh")
+        expect(!RadioBackgroundMetadataPolicy.shouldRefresh(
+            isRadio: true, isPlaying: false, appState: .background
+        ), "Paused background radio never polls")
+        expect(!RadioBackgroundMetadataPolicy.shouldRefresh(
+            isRadio: false, isPlaying: true, appState: .background
+        ), "Music playback never polls a station provider")
+
+        let liveFields = RadioBackgroundMetadataPolicy.lockScreenFields(
+            stationTitle: "Radio Paradise", stationArtist: "",
+            songTitle: "Come Together", songArtist: "The Beatles"
+        )
+        expect(liveFields.title == "Come Together"
+               && liveFields.artist == "The Beatles"
+               && liveFields.album == "Radio Paradise",
+               "Now Playing shows the song and retains the station")
+        let noArtist = RadioBackgroundMetadataPolicy.lockScreenFields(
+            stationTitle: "FIP", stationArtist: "",
+            songTitle: "Unknown Composition", songArtist: ""
+        )
+        expect(noArtist.title == "Unknown Composition"
+               && noArtist.artist == "FIP" && noArtist.album == "FIP",
+               "Missing artist falls back to the station")
+        let noSong = RadioBackgroundMetadataPolicy.lockScreenFields(
+            stationTitle: "BBC Radio 6 Music", stationArtist: "BBC",
+            songTitle: nil, songArtist: nil
+        )
+        expect(noSong.title == "BBC Radio 6 Music"
+               && noSong.artist == "BBC" && noSong.album.isEmpty,
+               "No broadcaster song keeps original station metadata")
+        let stationEcho = RadioBackgroundMetadataPolicy.lockScreenFields(
+            stationTitle: "BBC Radio 6 Music", stationArtist: "BBC",
+            songTitle: "BBC Radio 6 Music", songArtist: "BBC"
+        )
+        expect(stationEcho == noSong,
+               "Station-name-only titles never masquerade as a detected song")
+
+        // Do not expose cached ICY metadata from station A while station B
+        // is being selected or while mpv has not committed the new stream.
+        expect(RadioBackgroundMetadataPolicy.mayReadICY(
+            isRadio: true, selectedStationID: "radio:B",
+            activeStationID: "radio:B", pendingStationID: nil
+        ), "Current fully loaded radio can publish ICY metadata")
+        expect(!RadioBackgroundMetadataPolicy.mayReadICY(
+            isRadio: true, selectedStationID: "radio:B",
+            activeStationID: "radio:A", pendingStationID: "radio:B"
+        ), "Old station ICY blocked during replacement")
+        expect(!RadioBackgroundMetadataPolicy.mayReadICY(
+            isRadio: true, selectedStationID: "radio:B",
+            activeStationID: "radio:B", pendingStationID: "radio:B"
+        ), "Pending new mpv load blocks premature ICY metadata")
+        expect(!RadioBackgroundMetadataPolicy.mayReadICY(
+            isRadio: false, selectedStationID: "video:one",
+            activeStationID: "video:one", pendingStationID: nil
+        ), "Music never inherits stale radio title")
+
+        let broadcastSong = RadioNowPlaying(
+            artist: "Sting", title: "Desert Rose",
+            album: "Brand New Day", coverURL: nil
+        )
+        let previousSong = RadioNowPlaying(
+            artist: "Sting", title: "Fields of Gold",
+            album: nil, coverURL: nil
+        )
+        expect(RadioBackgroundMetadataPolicy.acceptsProvider(
+            broadcastSong, currentICYRaw: nil, stationName: "FIP"
+        ), "Non-ICY stations may use provider current song")
+        expect(RadioBackgroundMetadataPolicy.acceptsProvider(
+            broadcastSong,
+            currentICYRaw: "Sting - Desert Rose", stationName: "FIP"
+        ), "Aligned ICY and broadcaster API can enrich artwork")
+        expect(!RadioBackgroundMetadataPolicy.acceptsProvider(
+            previousSong,
+            currentICYRaw: "Sting - Desert Rose", stationName: "FIP"
+        ), "Late provider response cannot overwrite newer in-stream title")
+        expect(!RadioBackgroundMetadataPolicy.acceptsProvider(
+            RadioNowPlaying(
+                artist: "Another Artist", title: "Desert Rose",
+                album: nil, coverURL: nil
+            ),
+            currentICYRaw: "Sting - Desert Rose", stationName: "FIP"
+        ), "Conflicting artist cannot replace actual in-stream recording")
+        expect(RadioBackgroundMetadataPolicy.acceptsProvider(
+            broadcastSong, currentICYRaw: "FIP", stationName: "FIP"
+        ), "Station-only ICY remains eligible for broadcaster API fallback")
+
+        // Repeated ICY ticks for a song with no match must not query the
+        // artwork catalogue once per second; a fresh broadcaster URL may.
+        let artworkClock = Date(timeIntervalSince1970: 1_700_000_000)
+        let artworkRetry = artworkClock.addingTimeInterval(60)
+        expect(RadioBackgroundMetadataPolicy.mayAttemptArtwork(
+            key: "sting|desert rose|", failedKey: nil,
+            retryAfter: nil, now: artworkClock
+        ), "First live cover lookup proceeds immediately")
+        expect(!RadioBackgroundMetadataPolicy.mayAttemptArtwork(
+            key: "sting|desert rose|", failedKey: "sting|desert rose|",
+            retryAfter: artworkRetry, now: artworkClock.addingTimeInterval(1)
+        ), "Failed live cover is not retried on the next ICY tick")
+        expect(RadioBackgroundMetadataPolicy.mayAttemptArtwork(
+            key: "sting|desert rose|", failedKey: "sting|desert rose|",
+            retryAfter: artworkRetry, now: artworkRetry
+        ), "Failed cover becomes eligible again when cooldown expires")
+        expect(RadioBackgroundMetadataPolicy.mayAttemptArtwork(
+            key: "sting|desert rose|https://example.org/cover.jpg",
+            failedKey: "sting|desert rose|", retryAfter: artworkRetry,
+            now: artworkClock.addingTimeInterval(1)
+        ), "New broadcaster cover bypasses a failed catalogue-only lookup")
+        expect(RadioBackgroundMetadataPolicy.mayAttemptArtwork(
+            key: "sting|desert rose|brand new day|",
+            failedKey: "sting|desert rose||", retryAfter: artworkRetry,
+            now: artworkClock.addingTimeInterval(1)
+        ), "New album credits bypass a failed no-album lookup")
+        expect(RadioBackgroundMetadataPolicy.mayPublishStationArtwork(
+            isRadio: true, liveSongHasArtwork: false
+        ), "Radio station logo may show until song art arrives")
+        expect(!RadioBackgroundMetadataPolicy.mayPublishStationArtwork(
+            isRadio: true, liveSongHasArtwork: true
+        ), "Late radio station logo never replaces identified song artwork")
+        expect(RadioBackgroundMetadataPolicy.mayPublishStationArtwork(
+            isRadio: false, liveSongHasArtwork: true
+        ), "Regular song artwork continues to use its own thumbnail pipeline")
+
         print("PASS: \(passed) radio transport / metadata / station race checks")
     }
 }
