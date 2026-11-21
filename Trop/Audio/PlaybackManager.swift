@@ -305,6 +305,9 @@ actor PlaybackManager {
     /// on YouTube and only use the others when YouTube has no stream.
     private var prefers320Lossy: Bool {
         guard lossySourcesAllowed else { return false }
+        // The music High tier itself selects 320, regardless of the
+        // separate YouTube-only audioQuality option.
+        if SettingsStore.shared.musicQualityMode == .high { return true }
         let quality = SettingsStore.shared.audioQuality
         return quality == .auto || quality == .high
     }
@@ -370,11 +373,16 @@ actor PlaybackManager {
         preference: AddonQualityPreference
     ) -> Bool {
         let quality = result.audioQuality.lowercased()
+        let mode = SettingsStore.shared.musicQualityMode
+        guard MusicRecordingSelectionPolicy.acceptsPrefetchedQuality(
+            mode: mode.rawValue, quality: quality
+        ) else { return false }
         if quality.contains("addon-aac") || quality.contains("jiosaavn") {
-            let mode = SettingsStore.shared.musicQualityMode
             let allowedMode = mode != .cd && mode != .lossless
             let qualitySetting = SettingsStore.shared.audioQuality
-            return allowedMode && (qualitySetting == .auto || qualitySetting == .high)
+            return allowedMode && (
+                mode == .high || qualitySetting == .auto || qualitySetting == .high
+            )
         }
         if quality.contains("atmos") { return preference.preferAtmos }
         guard isLosslessResult(result) else { return false }
@@ -401,6 +409,19 @@ actor PlaybackManager {
         }
         if let cached, Self.resultMatches(cached, preference: preference) {
             return cached
+        }
+        if SettingsStore.shared.musicQualityMode == .high {
+            let fallback = await resolveLossyBestWithinBudget(
+                videoId: videoId,
+                seconds: budget ?? (interactive ? 6 : 12)
+            )
+            if let fallback {
+                if upgradeResultCache.count >= 100 {
+                    upgradeResultCache.removeAll(keepingCapacity: true)
+                }
+                upgradeResultCache[videoId] = (fallback, Date())
+            }
+            return fallback
         }
         if let lossless = await losslessWithinBudget(
             videoId: videoId,
@@ -472,7 +493,9 @@ actor PlaybackManager {
         let query = artist.isEmpty ? title : "\(artist) \(title)"
         let client = JioSaavnClient()
         guard let tracks = try? await client.search(query: query, limit: 8),
-              let best = Self.bestCatalogMatch(tracks, title: title, artist: artist),
+              let best = Self.bestCatalogMatch(
+                   tracks, title: title, artist: artist, duration: song.duration
+               ),
               best.isStreamable,
               let url = try? await client.resolveStreamURL(for: best.id.rawValue),
               let finalURL = await Self.verifiedStreamURL(url.absoluteString) else {
@@ -511,6 +534,24 @@ actor PlaybackManager {
             }
             group.cancelAll()
             return best
+        }
+    }
+
+    /// Race source discovery against a deadline: never wait indefinitely
+    /// for an unavailable provider when the user requested High quality.
+    private func resolveLossyBestWithinBudget(
+        videoId: String,
+        seconds: Double
+    ) async -> PlaybackResult? {
+        await withTaskGroup(of: PlaybackResult?.self) { group in
+            group.addTask { await self.resolveLossyBest(videoId: videoId) }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(seconds))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
         }
     }
 
@@ -940,30 +981,24 @@ actor PlaybackManager {
         return "Standard"
     }
 
-    private static func normalizedMatchKey(_ value: String) -> String {
-        value
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            .replacingOccurrences(of: "\\s*[\\[(][^\\])]*[\\])]", with: "", options: .regularExpression)
-            .replacingOccurrences(of: "[^a-z0-9 ]", with: "", options: .regularExpression)
-            .trimmingCharacters(in: .whitespaces)
-    }
-
+    /// A catalogue search is not evidence that its first title hit is the
+    /// requested recording. Missing artist or duration must fail closed.
     private static func bestCatalogMatch(
         _ tracks: [MusicCatalogTrack],
         title: String,
-        artist: String
+        artist: String,
+        duration: Int
     ) -> MusicCatalogTrack? {
-        let key = normalizedMatchKey(title)
-        guard !key.isEmpty else { return nil }
-        let artistKey = normalizedMatchKey(artist)
-        for track in tracks {
-            guard normalizedMatchKey(track.title) == key else { continue }
-            if artistKey.isEmpty { return track }
-            let trackArtist = normalizedMatchKey(track.artist)
-            if trackArtist.contains(artistKey) || artistKey.contains(trackArtist) { return track }
+        tracks.first { track in
+            TextMatch.verifiedAudioSource(
+                wantedTitle: title,
+                wantedArtist: artist,
+                wantedDuration: duration > 0 ? duration : nil,
+                candidateTitle: track.title,
+                candidateArtist: track.artist,
+                candidateDuration: track.durationSeconds
+            )
         }
-        // Exact title is required to avoid upgrading to the wrong song.
-        return tracks.first { normalizedMatchKey($0.title) == key }
     }
 
     /// Plays a downloaded copy if one exists, no matter which source it came
@@ -1044,7 +1079,8 @@ actor PlaybackManager {
         let isPlaying = await MainActor.run { NowPlaying.shared.isPlaying }
         if isPlaying, let previous, previous != videoId {
             await PlayerController.shared.fadeVolume(to: 0, duration: 0.12)
-            await MainActor.run { PlayerController.shared.setPaused(true) }
+            // Internal cross-track fade must not impersonate an explicit user Pause.
+            await MainActor.run { PlayerController.shared.setPaused(true, systemRecovery: true) }
             await MainActor.run { PlayerController.shared.setVolumeOverride(nil) }
         }
         // Downloaded files win over every network source, including add-ons:
@@ -1077,13 +1113,13 @@ actor PlaybackManager {
             guard await isCurrentIntent(intentGeneration) else {
                 throw CancellationError()
             }
-            return await playNetworkResult(
+            return try await playNetworkResult(
                 result, videoId: videoId, intentGeneration: intentGeneration
             )
         }
         if MusicPlaybackIdentity.isLegacyPencari(videoId) {
             let result = try await resolveLegacyPencari(videoId: videoId)
-            await playNetworkResult(result, videoId: videoId, intentGeneration: intentGeneration)
+            try await playNetworkResult(result, videoId: videoId, intentGeneration: intentGeneration)
             scheduleUpgradePrefetch(videoId: videoId)
             return result
         }
@@ -1135,22 +1171,65 @@ actor PlaybackManager {
             var usable = cached.age < 90
             if !usable { usable = await Self.verifyStream(upgrade.streamUrl) }
             if usable {
-                await playNetworkResult(upgrade, videoId: videoId, intentGeneration: intentGeneration)
+                try await playNetworkResult(upgrade, videoId: videoId, intentGeneration: intentGeneration)
                 scheduleUpgradePrefetch(videoId: videoId)
                 return upgrade
             }
             upgradeResultCache[videoId] = nil
         }
 
-        // Off (or no add-on FLAC): Auto/High start straight in the lossy pool
-        // (JioSaavn / AAC 320) instead of YouTube.
+        // Cold first play must honor the quality tier, not silently use a
+        // YouTube music-video soundtrack because nothing was prefetched.
+        // Explicitly requested video mode bypasses the music-source search.
+        let selectedSong = await queueSong(for: videoId)
+        let explicitlyVideo = selectedSong?.recordingPreference == .musicVideo
+        let qualityMode = SettingsStore.shared.musicQualityMode
+        let probeFirst = MusicRecordingSelectionPolicy.shouldProbeSourcesBeforeYouTube(
+            mode: qualityMode.rawValue,
+            hasAddons: SettingsStore.shared.hasMusicAddons,
+            prefers320: prefers320Lossy
+        )
+        if !explicitlyVideo, probeFirst, addonPreference != nil {
+            let preferred: PlaybackResult?
+            if qualityMode == .high {
+                // High requests verified AAC/MP3 320, not an unsolicited FLAC.
+                preferred = await resolveLossyBestWithinBudget(
+                    videoId: videoId, seconds: 6
+                )
+            } else {
+                let waitSeconds = qualityMode.prefersLossless ? 10.0 : 4.0
+                preferred = await resolvePreferredUpgrade(
+                    videoId: videoId, interactive: true, budget: waitSeconds
+                )
+            }
+            guard await isCurrentIntent(intentGeneration) else {
+                throw CancellationError()
+            }
+            if let preferred {
+                Log.player.info(
+                    "SOURCE_FIRST accepted videoId=\(videoId) tier=\(qualityMode.rawValue) provider=\(preferred.clientName) quality=\(preferred.audioQuality)"
+                )
+                upgradeResultCache[videoId] = (preferred, Date())
+                let played = try await playNetworkResult(
+                    preferred, videoId: videoId, intentGeneration: intentGeneration
+                )
+                scheduleUpgradePrefetch(videoId: videoId)
+                return played
+            }
+            Log.player.info(
+                "SOURCE_FIRST unavailable videoId=\(videoId) tier=\(qualityMode.rawValue) tryingVerifiedYouTubeATV"
+            )
+        }
+
+        // No addon preference: Auto/High still search the verified 320 pool
+        // (JioSaavn / AAC 320) before YouTube.
         if addonPreference == nil, prefers320Lossy,
            let lossy = await resolveLossyBest(videoId: videoId) {
             if upgradeResultCache.count >= 100 {
                 upgradeResultCache.removeAll(keepingCapacity: true)
             }
             upgradeResultCache[videoId] = (lossy, Date())
-            await playNetworkResult(lossy, videoId: videoId, intentGeneration: intentGeneration)
+            try await playNetworkResult(lossy, videoId: videoId, intentGeneration: intentGeneration)
             scheduleUpgradePrefetch(videoId: videoId)
             return lossy
         }
@@ -1160,7 +1239,7 @@ actor PlaybackManager {
             if let upgrade = prefetchedUpgrade(videoId: videoId),
                Self.shouldPreferUpgrade(upgrade, over: cached) {
                 if await Self.verifyStream(upgrade.streamUrl) {
-                    await playNetworkResult(upgrade, videoId: videoId, intentGeneration: intentGeneration)
+                    try await playNetworkResult(upgrade, videoId: videoId, intentGeneration: intentGeneration)
                     scheduleUpgradePrefetch(videoId: videoId)
                     return upgrade
                 }
@@ -1168,7 +1247,7 @@ actor PlaybackManager {
             }
             // Cache can hold the video's transport response; still apply
             // album-audio verification when the selected row is a song.
-            let played = await playNetworkResult(
+            let played = try await playNetworkResult(
                 cached, videoId: videoId, intentGeneration: intentGeneration
             )
             scheduleUpgradePrefetch(videoId: videoId)
@@ -1198,7 +1277,7 @@ actor PlaybackManager {
                         self.upgradeResultCache.removeAll(keepingCapacity: true)
                     }
                     self.upgradeResultCache[videoId] = (lossy, Date())
-                    await self.playNetworkResult(lossy, videoId: videoId, intentGeneration: intentGeneration)
+                    try await self.playNetworkResult(lossy, videoId: videoId, intentGeneration: intentGeneration)
                     self.scheduleUpgradePrefetch(videoId: videoId)
                     return lossy
                 }
@@ -1229,14 +1308,14 @@ actor PlaybackManager {
         if let upgrade = prefetchedUpgrade(videoId: videoId),
            Self.shouldPreferUpgrade(upgrade, over: result) {
             if await Self.verifyStream(upgrade.streamUrl) {
-                await playNetworkResult(upgrade, videoId: videoId, intentGeneration: intentGeneration)
+                try await playNetworkResult(upgrade, videoId: videoId, intentGeneration: intentGeneration)
                 scheduleUpgradePrefetch(videoId: videoId)
                 return upgrade
             }
             // Dead cached URL (origin rotated/expired): drop it, use YouTube.
             upgradeResultCache[videoId] = nil
         }
-        let played = await playNetworkResult(
+        let played = try await playNetworkResult(
             result, videoId: videoId, intentGeneration: intentGeneration
         )
         // Warm this track (for replays) and the next two while it plays. Off
@@ -1411,7 +1490,7 @@ actor PlaybackManager {
         _ result: PlaybackResult,
         videoId: String,
         intentGeneration: Int
-    ) async -> PlaybackResult {
+    ) async throws -> PlaybackResult {
         guard await isCurrentIntent(intentGeneration) else {
             Log.player.info(
                 "PLAY_INTENT drop result gen=\(intentGeneration) videoId=\(videoId)"
@@ -1425,7 +1504,25 @@ actor PlaybackManager {
             song: queueSong,
             intentGeneration: intentGeneration
         )
-        guard await isCurrentIntent(intentGeneration) else { return result }
+        guard await isCurrentIntent(intentGeneration) else { throw CancellationError() }
+        // A stream carrying audio may still be the soundtrack of an OMV/UGC.
+        // Never disguise it as an album song unless video was requested.
+        let externalSource = ["addon", "jiosaavn", "qobuz", "audius", "local"]
+            .contains(audioResult.clientName.lowercased())
+        let wrongVideoSource = !externalSource
+            && audioResult.videoId == videoId
+            && MusicRecordingSelectionPolicy.forbidsVideoSoundtrack(
+                selectedVideo: queueSong?.recordingPreference == .musicVideo,
+                rowType: queueSong?.musicVideoType,
+                sourceType: audioResult.musicVideoType,
+                rowIsVideo: queueSong?.isVideo == true
+            )
+        if wrongVideoSource {
+            Log.player.error(
+                "MUSIC_MATCH rejected video soundtrack as song selected=\(videoId) source=\(audioResult.clientName)"
+            )
+            throw MusicCatalogError.unavailableTrack
+        }
         let queueArtistName = queueSong.map { artistDisplayString(from: $0.artists) } ?? ""
         let fallbackAuthor = result.author?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let artistName = !queueArtistName.isEmpty ? queueArtistName : fallbackAuthor

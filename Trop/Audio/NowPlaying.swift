@@ -10,6 +10,7 @@ import Foundation
 import Observation
 import Nuke
 import SwiftUI
+import UIKit
 
 /// The song currently playing on a radio stream (from ICY metadata), enriched
 /// with canonical metadata and artwork when available.
@@ -170,6 +171,12 @@ final class NowPlaying {
     @ObservationIgnored private var artworkLoadTask: Task<Void, Never>?
     @ObservationIgnored private var enrichTask: Task<Void, Never>?
     @ObservationIgnored private var liveResolveTask: Task<Void, Never>?
+    @ObservationIgnored private var radioMetadataTask: Task<Void, Never>?
+    @ObservationIgnored private var radioArtworkTask: Task<Void, Never>?
+    @ObservationIgnored private var lastRadioMetadataFetch = Date.distantPast
+    @ObservationIgnored private var radioMetadataFailures = 0
+    @ObservationIgnored private var radioMetadataCooldownUntil: Date?
+    @ObservationIgnored private var lastRadioArtworkKey: String?
     var lastManualSkipTime: Date?
     private var isResolvingNext = false
     private var consecutiveFailures = 0
@@ -396,6 +403,14 @@ final class NowPlaying {
     }
 
     func playNext(automatic: Bool = false) {
+        let decoderPosition = PlayerController.shared.currentTime
+        Log.nowPlaying.info(
+            "QUEUE_ADVANCE requested cause=\(automatic ? "automatic" : "manual") "
+                + "videoId=\(videoId ?? "nil") gen=\(playbackGeneration) "
+                + "position=\(String(format: "%.3f", decoderPosition)) "
+                + "publishedDuration=\(String(format: "%.3f", duration)) "
+                + "hasNext=\(hasNext) resolving=\(isResolvingNext)"
+        )
         guard hasNext else { return }
         guard !isResolvingNext else { return }
         if !automatic {
@@ -406,7 +421,7 @@ final class NowPlaying {
             }
         }
         queueIndex += 1
-        playCurrentSong(logContext: "playNext")
+        playCurrentSong(logContext: automatic ? "playNextAutomatic" : "playNext")
     }
 
     func playPrevious() {
@@ -428,10 +443,22 @@ final class NowPlaying {
         guard queueSongs.indices.contains(queueIndex) else { return }
         playbackGeneration += 1
         let intent = playbackGeneration
+        // A genuine Next/Previous/queue tap should recover a stale session.
+        // EOF and repeat-current advances must never do so on their own.
+        if logContext != "playNextAutomatic" && logContext != "repeatCurrent" {
+            PlayerController.shared.markExplicitSelectionForInterruptionRecovery(
+                videoId: queueSongs[queueIndex].videoId, generation: intent
+            )
+        }
         if manageResolvingFlag {
             isResolvingNext = true
         }
         let song = queueSongs[queueIndex]
+        Log.nowPlaying.info(
+            "QUEUE_ADVANCE selected context=\(logContext) "
+                + "videoId=\(song.videoId) previous=\(videoId ?? "nil") "
+                + "gen=\(intent) index=\(queueIndex)"
+        )
         update(with: song)
         persistQueueState()
         Task {
@@ -488,7 +515,11 @@ final class NowPlaying {
             confirmedMetadata = nil
             publishedArtwork = nil
         }
-        self.isPlaying = true
+        // Metadata publication must not turn a paused selection back into
+        // an optimistic "playing" UI state while audio is still loading.
+        self.isPlaying = PlayerController.shared.wantsPlaybackForSelection(
+            videoId: videoId
+        )
         enrichTask?.cancel()
         liveResolveTask?.cancel()
         self.title = title
@@ -510,6 +541,14 @@ final class NowPlaying {
         self.videoId = videoId
         self.liveTitle = nil
         self.liveSongInfo = nil
+        radioMetadataTask?.cancel()
+        radioMetadataTask = nil
+        radioArtworkTask?.cancel()
+        radioArtworkTask = nil
+        lastRadioMetadataFetch = .distantPast
+        radioMetadataFailures = 0
+        radioMetadataCooldownUntil = nil
+        lastRadioArtworkKey = nil
         self.radioPlaybackStatus = .connecting
         self.hasVideo = false
         self.isVideoMode = false
@@ -553,6 +592,14 @@ final class NowPlaying {
         artistVideoId = nil
         liveTitle = nil
         liveSongInfo = nil
+        radioMetadataTask?.cancel()
+        radioMetadataTask = nil
+        radioArtworkTask?.cancel()
+        radioArtworkTask = nil
+        lastRadioMetadataFetch = .distantPast
+        radioMetadataFailures = 0
+        radioMetadataCooldownUntil = nil
+        lastRadioArtworkKey = nil
         radioPlaybackStatus = .connecting
         currentSourceName = nil
         currentResult = nil
@@ -666,6 +713,17 @@ final class NowPlaying {
 
     func stopped(videoId: String?, isEof: Bool = true) {
         guard self.videoId == videoId else { return }
+        let decoderPosition = PlayerController.shared.currentTime
+        let early = isEof && PlaybackEndEvidence.isMateriallyEarly(
+            decoderPosition: decoderPosition, expectedDuration: duration
+        )
+        Log.nowPlaying.info(
+            "PLAYBACK_END received reason=\(isEof ? "eof" : "failure") "
+                + "videoId=\(videoId ?? "nil") gen=\(playbackGeneration) "
+                + "decoderPosition=\(String(format: "%.3f", decoderPosition)) "
+                + "publishedDuration=\(String(format: "%.3f", duration)) "
+                + "early=\(early) kind=\(String(describing: playbackKind))"
+        )
         if playbackKind == .radio {
             // Radio is an indefinite station, never a completed queue song.
             // Avoid YouTube re-resolve/queue advance after a station error.
@@ -692,6 +750,18 @@ final class NowPlaying {
         if let finishedId = videoId,
            duration >= 600 || musicVideoType == "MUSIC_VIDEO_TYPE_PODCAST_EPISODE" {
             Task { await EpisodePlaybackStore.shared.markPlayed(videoId: finishedId) }
+        }
+        // EOF can arrive after a user paused or while Apolo was preparing
+        // the next item. It must never consume the queue behind a Pause.
+        guard PlayerController.shared.canAdvanceQueueAutomatically else {
+            Log.nowPlaying.info(
+                "PLAYBACK_INTENT EOF held on pause videoId=\(videoId ?? "nil") gen=\(playbackGeneration)"
+            )
+            isPlaying = false
+            stopTimer()
+            PlayerController.shared.updateNowPlayingProgress()
+            Task { await PlaybackStateService.shared.stopTracking() }
+            return
         }
         if isRepeatOn {
             repeatCurrent()
@@ -874,12 +944,13 @@ final class NowPlaying {
         // Safety net: callers that resolve without song metadata pass nil.
         // The queue usually still knows this track's artwork — use it rather
         // than falling back to the low-res ytimg default.
+        let selectedSong = queueSongs.first { $0.videoId == videoId }
         var thumb = thumbnailUrl
         if thumb == nil {
-            thumb = queueSongs.first { $0.videoId == videoId }?.thumbnailUrl
+            thumb = selectedSong?.thumbnailUrl
         }
 
-        let kind = queueSongs.first { $0.videoId == videoId }?.contentKind
+        let kind = selectedSong?.contentKind
         let isPodcast = kind == .episode || kind == .podcast
         let isMusic = !isPodcast
             && playbackKind != .radio
@@ -894,16 +965,27 @@ final class NowPlaying {
             }
             guard !Task.isCancelled, lastLoadedVideoId == videoId else { return }
             if isMusic {
-                // The artwork selected in Album / Quick Picks is the UI's
-                // trusted source. A cross-catalogue best guess must not
-                // replace it with a video thumbnail or another release.
-                // Resize the SAME CDN image when supported, never switch
-                // to the YouTube video's maxres/hqdefault variants.
+                // Album art and video frame thumbnails are NOT interchangeable.
+                // A YouTube still (or a video-classified row) is not proof
+                // of an album cover, even if the AUDIO stream is FLAC.
                 if let thumb, !thumb.isEmpty {
+                    let needsVerifiedCover = MusicArtworkSelectionPolicy.shouldResolveVerifiedCover(
+                        thumbnailURL: thumb,
+                        isVideo: selectedSong?.isVideo,
+                        musicVideoType: selectedSong?.musicVideoType
+                    )
+                    if needsVerifiedCover {
+                        let resolved = await resolveCanonicalArtwork(videoId: videoId)
+                        guard !Task.isCancelled, lastLoadedVideoId == videoId else { return }
+                        if resolved { return }
+                    }
+                    // Keep verified release art when available. For video
+                    // previews, attempt maxres/sd variants before hqdefault;
+                    // never enlarge a tiny original hq frame as the first pick.
                     loadThumbnailFromCDN(
                         videoId: videoId,
                         thumbnailUrl: thumb,
-                        preferSourceArtwork: true
+                        preferSourceArtwork: !MusicArtworkSelectionPolicy.isVideoThumbnail(thumb)
                     )
                     return
                 }
@@ -943,15 +1025,18 @@ final class NowPlaying {
             title: title, artist: artist, album: album, duration: duration, seconds: 2.5
         )
         guard !Task.isCancelled, lastLoadedVideoId == videoId else { return false }
-        var coverURL = resolved?.artworkURL
-        if let resolved {
-            guard TextMatch.recordingsMatch(resolved.title, title),
-                  TextMatch.artistsMatch(resolved.artist, artist) else { return false }
+        var coverURL: URL?
+        if let resolved,
+           TextMatch.recordingsMatch(resolved.title, title),
+           TextMatch.normalizeArtist(resolved.artist) == TextMatch.normalizeArtist(artist),
+           MusicArtworkSelectionPolicy.matchesRequestedRelease(
+               requested: album, candidate: resolved.album
+           ) {
+            coverURL = resolved.artworkURL
             acceptResolvedMetadata(resolved, videoId: videoId, replaceExisting: true)
         }
-        // A remaster/live qualifier may prevent a verified track match. Its
-        // known release can still supply artwork, without rewriting recording
-        // metadata or accepting another recording with a similar title.
+        // Do not accept a same-named single/compilation for an album track.
+        // A known release can still supply art without rewriting song text.
         if coverURL == nil, let album, !album.isEmpty {
             coverURL = await MetadataResolver.albumArtwork(title: album, artist: artist)
         }
@@ -960,7 +1045,9 @@ final class NowPlaying {
               let artworkURL = URL(string: artworkString),
               let image = try? await ArtworkLoader.image(for: artworkURL) else { return false }
         guard !Task.isCancelled, lastLoadedVideoId == videoId,
-              Self.artworkSide(image) > minimumArtworkSide else { return false }
+              Self.artworkSide(image) >= max(480, minimumArtworkSide + 1) else {
+            return false
+        }
         resolvedArtworkVideoId = videoId
         publishedArtwork = (videoId, artworkURL.absoluteString)
         publishArtwork(image)
@@ -1093,10 +1180,14 @@ final class NowPlaying {
     /// YouTube can return HTTP 200 with a tiny placeholder for an unavailable
     /// maxres image. Skip it so the next actual resolution can be tried.
     private static func isUsableArtwork(_ image: UIImage, for url: URL) -> Bool {
-        guard url.host?.hasSuffix("ytimg.com") == true else { return true }
+        guard MusicArtworkSelectionPolicy.isVideoThumbnail(url.absoluteString) else {
+            return true
+        }
         let width = image.cgImage?.width ?? Int(image.size.width * image.scale)
         let height = image.cgImage?.height ?? Int(image.size.height * image.scale)
-        return width > 120 && height > 90
+        return MusicArtworkSelectionPolicy.acceptableVideoImageSize(
+            width: width, height: height
+        )
     }
 
     private static func artworkSide(_ image: UIImage) -> CGFloat {
@@ -1251,6 +1342,7 @@ final class NowPlaying {
         icyTick += 1
         if icyTick % 4 == 0, playbackKind == .radio {
             refreshLiveTitle()
+            refreshRadioMetadataIfNeeded()
         }
         if let videoId, duration >= 600 || musicVideoType == "MUSIC_VIDEO_TYPE_PODCAST_EPISODE" {
             let vid = videoId
@@ -1266,44 +1358,148 @@ final class NowPlaying {
     /// station) and publishes it when it changes.
     private func refreshLiveTitle() {
         guard let icy = PlayerController.shared.icyTitle(), !icy.isEmpty else { return }
-        guard liveTitle != icy else { return }
-        liveTitle = icy
-        resolveLiveSong(icy)
+        guard let parsed = ICYTitleParser.parse(icy, stationName: displayTitle) else { return }
+        let display = parsed.display
+        guard liveTitle != display else { return }
+        applyRadioNowPlaying(RadioNowPlaying(
+            artist: parsed.artist,
+            title: parsed.title,
+            album: nil,
+            coverURL: nil
+        ))
     }
 
-    /// Splits an ICY title ("Artist - Title") and enriches it with a catalogue
-    /// lookup, so the player can show the full song and offer to save it.
-    private func resolveLiveSong(_ raw: String) {
-        let parts = Self.splitICY(raw)
-        liveSongInfo = LiveSongInfo(title: parts.title, artist: parts.artist, album: nil, artwork: nil)
-        liveResolveTask?.cancel()
-        liveResolveTask = Task {
-            guard !Task.isCancelled else { return }
-            guard let resolved = await MetadataResolver.enrich(title: parts.title, artist: parts.artist) else { return }
-            var artwork: Data?
-            if let url = resolved.artworkURL {
-                artwork = try? await URLSession.shared.data(from: url).0
-            }
-            guard liveTitle == raw else { return }
-            liveSongInfo = LiveSongInfo(
-                title: resolved.title,
-                artist: resolved.artist,
-                album: resolved.album,
-                artwork: artwork
-            )
+    /// Broadcasters without ICY (Radio Paradise AAC/MP3, etc.) get their
+    /// now-playing data from a per-station API instead.
+    private func refreshRadioMetadataIfNeeded() {
+        guard playbackKind == .radio,
+              isPlaying,
+              UIApplication.shared.applicationState == .active,
+              let raw = currentStreamURL,
+              let url = URL(string: raw),
+              let provider = RadioMetadataProviders.provider(for: url, stationName: displayTitle) else {
+            return
         }
+        if let until = radioMetadataCooldownUntil, Date() < until { return }
+        guard Date().timeIntervalSince(lastRadioMetadataFetch) >= 30 else { return }
+        lastRadioMetadataFetch = Date()
+        radioMetadataTask?.cancel()
+        let stationName = displayTitle
+        let identity = RadioMetadataIdentity(
+            generation: playbackGeneration,
+            stationID: videoId,
+            streamURL: raw
+        )
+        radioMetadataTask = Task { [weak self] in
+            let data = await provider.metadata(for: url, stationName: stationName)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self, self.isPlaying, self.playbackKind == .radio,
+                      identity.matches(
+                          generation: self.playbackGeneration,
+                          stationID: self.videoId,
+                          streamURL: self.currentStreamURL
+                      ) else { return }
+                if let data {
+                    self.radioMetadataFailures = 0
+                    self.radioMetadataCooldownUntil = nil
+                    self.applyRadioNowPlaying(data)
+                } else {
+                    self.radioMetadataFailures += 1
+                    if self.radioMetadataFailures >= 3 {
+                        self.radioMetadataCooldownUntil = Date().addingTimeInterval(300)
+                        self.radioMetadataFailures = 0
+                    }
+                }
+            }
+        }
+    }
+
+    private func applyRadioNowPlaying(_ data: RadioNowPlaying) {
+        guard playbackKind == .radio else { return }
+        let artist = data.artist.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = data.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard title.count >= 2 else { return }
+        if title.caseInsensitiveCompare(displayTitle) == .orderedSame { return }
+        let display = artist.isEmpty ? title : "\(artist) - \(title)"
+        if liveTitle != display {
+            liveResolveTask?.cancel()
+            radioArtworkTask?.cancel()
+            liveTitle = display
+            liveSongInfo = LiveSongInfo(title: title, artist: artist, album: data.album, artwork: nil)
+            lastRadioArtworkKey = nil
+            showRadioPlaceholderArtwork()
+        } else if liveSongInfo?.album == nil {
+            liveSongInfo?.album = data.album
+        }
+
+        // Prefer catalogue high-resolution art, but retain the broadcaster's
+        // real cover as a fallback. Cancel and verify origin across awaits.
+        let key = "\(artist.lowercased())|\(title.lowercased())"
+        if let liveSongInfo, liveSongInfo.artwork != nil { return }
+        if lastRadioArtworkKey == key { return }
+        lastRadioArtworkKey = key
+        radioArtworkTask?.cancel()
+        let identity = RadioMetadataIdentity(
+            generation: playbackGeneration,
+            stationID: videoId,
+            streamURL: currentStreamURL
+        )
+        radioArtworkTask = Task { [weak self] in
+            let resolved: ResolvedMetadata?
+            if artist.isEmpty {
+                resolved = nil
+            } else {
+                resolved = await MetadataResolver.enrich(title: title, artist: artist)
+            }
+            guard !Task.isCancelled else { return }
+            let preferred = ArtworkURLs.highRes(resolved?.artworkURL?.absoluteString)
+                .flatMap(URL.init(string:))
+            let providerCover = data.coverURL?.scheme?.lowercased() == "https"
+                ? data.coverURL : nil
+            var image: UIImage?
+            if let preferred {
+                image = try? await ArtworkLoader.image(for: preferred)
+            }
+            if image == nil, let providerCover {
+                image = try? await ArtworkLoader.image(for: providerCover)
+            }
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self, self.isPlaying, self.playbackKind == .radio,
+                      self.liveTitle == display,
+                      identity.matches(
+                          generation: self.playbackGeneration,
+                          stationID: self.videoId,
+                          streamURL: self.currentStreamURL
+                      ) else { return }
+                if let image {
+                    self.publishArtwork(image)
+                    self.liveSongInfo?.artwork = image.pngData()
+                    if let album = resolved?.album, self.liveSongInfo?.album == nil {
+                        self.liveSongInfo?.album = album
+                    }
+                } else if self.lastRadioArtworkKey == key {
+                    // Do not permanently suppress a retry when art was missing.
+                    self.lastRadioArtworkKey = nil
+                }
+            }
+        }
+    }
+
+    /// Drops the previous song's cover as soon as a new song starts or the
+    /// station stops; nothing is kept in a cover cache.
+    private func showRadioPlaceholderArtwork() {
+        guard playbackKind == .radio else { return }
+        thumbnailUIImage = nil
+        thumbnailImage = Image(systemName: "dot.radiowaves.left.and.right")
+        PlayerController.shared.updateNowPlayingArtwork()
     }
 
     /// Splits a raw ICY stream title into artist and title.
     static func splitICY(_ raw: String) -> (artist: String, title: String) {
-        for separator in [" - ", " – ", " — "] {
-            if let range = raw.range(of: separator) {
-                let artist = raw[..<range.lowerBound].trimmingCharacters(in: .whitespaces)
-                let title = raw[range.upperBound...].trimmingCharacters(in: .whitespaces)
-                if !artist.isEmpty, !title.isEmpty {
-                    return (String(artist), String(title))
-                }
-            }
+        if let parsed = ICYTitleParser.parse(raw) {
+            return (parsed.artist, parsed.title)
         }
         return ("", raw.trimmingCharacters(in: .whitespaces))
     }

@@ -26,9 +26,13 @@ struct ContentView: View {
             backgroundLayer
 
             tabContent
+                .allowsHitTesting(!sheet.isExpanded)
+                .accessibilityHidden(sheet.isExpanded)
 
             if sheet.isExpanded {
                 FullPlayerView(artworkNamespace: playerArtworkNamespace, usesDarkArtwork: colorScheme == .dark, onCollapse: collapsePlayer)
+                    .allowsHitTesting(!sheet.isCollapsing)
+                    .accessibilityHidden(sheet.isCollapsing)
                     .ignoresSafeArea(.container, edges: .all)
                     .transition(.move(edge: .bottom))
             }

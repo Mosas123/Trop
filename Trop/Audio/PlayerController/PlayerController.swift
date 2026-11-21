@@ -92,8 +92,63 @@ final class PlayerController {
     /// previous song is still audibly playing.
     private var pendingMetadata: PendingMetadata?
     private var wasPlayingBeforeInterruption = false
+    private var interruptedPlaybackIdentity: (id: String?, generation: Int)?
+    /// An iOS-denied activation must not become a fake Play. Retry only for
+    /// this selection after the foreground is active or a fresh user Play.
+    private var pendingAudioSessionResume: (id: String?, generation: Int)?
+    private var headsetHandoffIntent: AudioRouteHandoffIntent?
+    /// Route-bound permission for an explicit user Play if iOS sends an
+    /// interruption begin on unplug but never sends the matching end.
+    /// Never authorizes automatic speaker playback.
+    private var unplugManualPlayPermit: HeadphoneUnplugManualPlayPermit?
     private var apoloAudioInterruptionActive = false
+    /// The route at the start of the CURRENT interruption. Without a route
+    /// change, an explicit foreground Play can safely ask iOS to reactivate.
+    private var interruptionRouteGeneration: UInt64?
+    /// Set only by a direct user song-selection entry point, not autoplay,
+    /// queue EOF, delayed loads, or engine fallback.
+    private var explicitRecoverySelection: (id: String, generation: Int)?
     private var apoloLastInterruptionEndedAt: Date?
+    /// Ignore stale route notifications and avoid overriding a newer Play/Pause.
+    private var routeChangeGeneration: UInt64 = 0
+    private var playbackCommandGeneration: UInt64 = 0
+    /// A real user Pause fences every delayed load for this selection,
+    /// including mpv fallback. An unrelated new selection can still play.
+    private var explicitlyPausedSelectionGeneration: Int?
+    private var explicitlyPausedSelectionVideoId: String?
+    private var lastStartedSelectionGeneration: Int?
+    private var lastStartedSelectionVideoId: String?
+    var wantsPlayback: Bool { sharedState.withLock { $0.desiredPlaying } }
+    private func userPauseGeneration(for videoId: String?) -> Int? {
+        guard explicitlyPausedSelectionVideoId == videoId else { return nil }
+        return explicitlyPausedSelectionGeneration
+    }
+    var isExplicitlyPausedForCurrentSelection: Bool {
+        userPauseGeneration(for: NowPlaying.shared.videoId)
+            == NowPlaying.shared.playbackGeneration
+    }
+    private var isAudioSessionResumePendingForCurrentSelection: Bool {
+        guard let pending = pendingAudioSessionResume else { return false }
+        return pending.id == NowPlaying.shared.videoId
+            && pending.generation == NowPlaying.shared.playbackGeneration
+    }
+    func wantsPlaybackForSelection(videoId: String) -> Bool {
+        PlaybackPausePolicy.shouldPlay(
+            generation: NowPlaying.shared.playbackGeneration,
+            explicitlyPausedGeneration: userPauseGeneration(for: videoId),
+            desiredPlaying: wantsPlayback,
+            isNewSelection: lastStartedSelectionGeneration != NowPlaying.shared.playbackGeneration
+                || lastStartedSelectionVideoId != videoId,
+            isEngineFallback: false
+        )
+    }
+    var canAdvanceQueueAutomatically: Bool {
+        PlaybackPausePolicy.shouldAdvanceAutomatically(
+            generation: NowPlaying.shared.playbackGeneration,
+            explicitlyPausedGeneration: userPauseGeneration(for: NowPlaying.shared.videoId),
+            desiredPlaying: wantsPlayback
+        )
+    }
     // Diagnostics only. Never used to decide when to resume or fall back.
     private var recoveryID: UInt64 = 0
     private var recoveryBegin: TimeInterval?
@@ -239,6 +294,16 @@ final class PlayerController {
 // MARK: - Playback
 
 extension PlayerController {
+    /// Called immediately after the user selects a track. The generation
+    /// fences out a delayed resolver or a later automatic queue advance.
+    func markExplicitSelectionForInterruptionRecovery(
+        videoId: String, generation: Int
+    ) {
+        guard apoloAudioInterruptionActive else { return }
+        explicitRecoverySelection = (id: videoId, generation: generation)
+        traceRecovery("explicitTrackSelectionMarked")
+    }
+
     /// Ignore only truly identical, already-playing/connecting radio requests.
     /// This guard precedes all source-load serial and AVPlayer teardown work.
     private func shouldSuppressDuplicateLiveRadioLoad(
@@ -316,6 +381,28 @@ extension PlayerController {
             Log.player.error("Invalid playback source URL")
             return
         }
+        let currentSelectionGeneration = NowPlaying.shared.playbackGeneration
+        if !bypassApolo {
+            let isNewSelection = lastStartedSelectionGeneration != currentSelectionGeneration
+                || lastStartedSelectionVideoId != videoId
+            let shouldPlay = PlaybackPausePolicy.shouldPlay(
+                generation: currentSelectionGeneration,
+                explicitlyPausedGeneration: userPauseGeneration(for: videoId),
+                desiredPlaying: wantsPlayback,
+                isNewSelection: isNewSelection,
+                isEngineFallback: false
+            )
+            lastStartedSelectionGeneration = currentSelectionGeneration
+            lastStartedSelectionVideoId = videoId
+            sharedState.withLock { $0.desiredPlaying = shouldPlay }
+            Log.player.info(
+                "PLAYBACK_INTENT load gen=\(currentSelectionGeneration) fresh=\(isNewSelection) desired=\(shouldPlay)"
+            )
+        } else {
+            Log.player.info(
+                "PLAYBACK_INTENT mpvFallback gen=\(currentSelectionGeneration) desired=\(wantsPlayback)"
+            )
+        }
 
         // SponsorBlock may await its segment prefetch. Do not change the
         // displayed title, stream quality or progress until the request still
@@ -353,6 +440,34 @@ extension PlayerController {
             NowPlaying.shared.videoId = videoId
         }
         guard NowPlaying.shared.videoId == videoId else { return }
+        if ForegroundInterruptionRecoveryPolicy.matchesExplicitSelection(
+            expectedID: explicitRecoverySelection?.id,
+            expectedGeneration: explicitRecoverySelection?.generation,
+            currentID: videoId,
+            currentGeneration: NowPlaying.shared.playbackGeneration,
+            desiredPlaying: wantsPlayback
+        ) {
+            explicitRecoverySelection = nil
+            if apoloAudioInterruptionActive {
+                // A fresh song tap is a user Play intent, not an automatic
+                // interruption resume. Reactivate before the new renderer
+                // is loaded so it doesn't inherit a permanently paused state.
+                _ = attemptExplicitInterruptionActivation(
+                    reason: "explicitTrackSelectionAfterInterruption"
+                )
+            }
+        }
+        if headsetHandoffIntent?.playbackID != videoId {
+            // A new selection supersedes any old Bluetooth handoff.
+            headsetHandoffIntent = nil
+        }
+        if apoloAudioInterruptionActive {
+            // A new song selected during interruption is the latest intent.
+            interruptedPlaybackIdentity = (
+                id: videoId, generation: NowPlaying.shared.playbackGeneration
+            )
+            wasPlayingBeforeInterruption = true
+        }
 
         currentLoudnessDb = loudnessDb
         NowPlaying.shared.losslessFormatLabel = losslessLabel
@@ -409,7 +524,8 @@ extension PlayerController {
         let prevVideoId = sharedState.withLock { $0.currentVideoId }
         let isNewSong = prevVideoId != nil && videoId != prevVideoId
 
-        sharedState.withLock { $0.desiredPlaying = true }
+        // The source may have resolved AFTER the user pressed Pause.
+        // Never reset desiredPlaying merely because mpv is loading.
         assertAudioSession()
         loadedMuxedURL = nil
         loadedVideoOnlyURL = nil
@@ -452,8 +568,11 @@ extension PlayerController {
             "TRANSITION play videoId=\(videoId ?? "nil") isNewSong=\(isNewSong) muxedActive=\(muxedActive) "
                 + "source=\(Self.apoloSource(url))"
         )
+        let holdForPauseOrInterruption = apoloAudioInterruptionActive || !wantsPlayback
         let cmdResult = withMpv { mpv -> Int32 in
-            mpv_set_property_string(mpv, "pause", "no")
+            mpv_set_property_string(
+                mpv, "pause", holdForPauseOrInterruption ? "yes" : "no"
+            )
             return loadArguments.withUnsafeCArg { mpv_command(mpv, $0) }
         } ?? -1
         if cmdResult != 0 {
@@ -477,8 +596,15 @@ extension PlayerController {
         guard PlaybackIntentGuard.isLatest(
             serial: requestSerial, latestSerial: playRequestSerial
         ) else { return }
-        playState.send(.playing)
-        NowPlaying.shared.isPlaying = true
+        let canStartAudio = !apoloAudioInterruptionActive
+            && sharedState.withLock { $0.desiredPlaying }
+        if apoloAudioInterruptionActive {
+            interruptedPlaybackIdentity = (
+                id: videoId, generation: NowPlaying.shared.playbackGeneration
+            )
+        }
+        playState.send(canStartAudio ? .playing : .paused)
+        NowPlaying.shared.isPlaying = canStartAudio
         NowPlaying.shared.currentTime = playbackStart
         NowPlaying.shared.duration = max(0, duration ?? 0)
         setNowPlayingMetadata()
@@ -518,13 +644,87 @@ extension PlayerController {
         }
     }
 
-    func setPaused(_ paused: Bool) {
+    func setPaused(
+        _ paused: Bool,
+        forceBackendCommand: Bool = false,
+        systemRecovery: Bool = false
+    ) {
+        if !systemRecovery {
+            // Pause, Play and explicit commands must survive every async load.
+            explicitlyPausedSelectionGeneration = paused
+                ? NowPlaying.shared.playbackGeneration : nil
+            explicitlyPausedSelectionVideoId = paused ? NowPlaying.shared.videoId : nil
+            if paused {
+                wasPlayingBeforeInterruption = false
+                headsetHandoffIntent = nil
+                pendingAudioSessionResume = nil
+            }
+            Log.player.info(
+                "PLAYBACK_INTENT userCommand=\(paused ? "pause" : "play") gen=\(NowPlaying.shared.playbackGeneration)"
+            )
+        }
         if !paused { traceRecovery("playRequested") }
+        playbackCommandGeneration &+= 1
         sharedState.withLock { $0.desiredPlaying = !paused }
+        // An explicit user Play can recover a missing legacy .ended callback
+        // when iOS grants a fresh activation. A stable-route interruption
+        // (e.g. video editing) must not depend on any AirPods route permit.
+        let explicitInterruptionRecovered = !paused && !systemRecovery
+            && apoloAudioInterruptionActive
+            && attemptExplicitInterruptionActivation(
+                reason: "explicitForegroundPlayAfterInterruption"
+            )
+        if !paused && apoloAudioInterruptionActive {
+            wasPlayingBeforeInterruption = true
+            traceRecovery("playDeferredUntilInterruptionEnds")
+            return
+        }
         let currentlyPaused = playState.value != .playing
-        guard currentlyPaused != paused else {
+        // A route handoff can pause/stall the renderer without first changing
+        // the UI's optimistic .playing state. Never discard a real Play command.
+        let apoloNeedsResume: Bool
+        if !paused, apoloIsActive {
+            if case .some(.playing) = apoloBackend?.state {
+                apoloNeedsResume = false
+            } else {
+                apoloNeedsResume = true
+            }
+        } else {
+            apoloNeedsResume = false
+        }
+        guard currentlyPaused != paused || forceBackendCommand
+                || apoloNeedsResume || explicitInterruptionRecovered else {
             updateNowPlayingProgress()
             return
+        }
+        // Never command a backend or publish an optimistic Play after iOS
+        // denied nonmixable audio activation (for example Apple Music !int).
+        // Keep the user's desiredPlaying intent for a safe foreground retry.
+        if !paused && !explicitInterruptionRecovered {
+            guard assertAudioSession(reason: "setPaused") else {
+                pendingAudioSessionResume = (
+                    id: NowPlaying.shared.videoId,
+                    generation: NowPlaying.shared.playbackGeneration
+                )
+                if apoloIsActive {
+                    apoloBackend?.pause()
+                } else {
+                    withMpv { mpv in
+                        var flag: Int32 = 1
+                        mpv_set_property(mpv, "pause", MPV_FORMAT_FLAG, &flag)
+                    }
+                }
+                playState.send(.paused)
+                NowPlaying.shared.isPlaying = false
+                traceRecovery("resumeDeferred.activationFailed")
+                Log.player.warning(
+                    "AUDIO_RECOVERY deferredPlay activationDenied "
+                        + "gen=\(NowPlaying.shared.playbackGeneration)"
+                )
+                updateNowPlayingProgress()
+                return
+            }
+            pendingAudioSessionResume = nil
         }
         if apoloIsActive {
             if paused { apoloBackend?.pause() } else { apoloBackend?.play() }
@@ -541,7 +741,6 @@ extension PlayerController {
             NowPlaying.shared.radioPlaybackStatus = paused
                 ? .paused : (apoloIsActive ? .connecting : .live)
         }
-        if !paused { assertAudioSession(reason: "setPaused") }
         updateNowPlayingProgress()
     }
 
@@ -1233,7 +1432,8 @@ extension PlayerController {
         Log.player.info("AUDIO_RECOVERY id=\(self.recoveryID) event=\(event) uptimeMs=\(uptimeMs) sinceBeginMs=\(elapsed) sinceEndMs=\(postEnd)")
     }
 
-    func assertAudioSession(reason: String = "unspecified") {
+    @discardableResult
+    func assertAudioSession(reason: String = "unspecified") -> Bool {
         let session = AVAudioSession.sharedInstance()
         let start = ProcessInfo.processInfo.systemUptime
         var stage = "category"
@@ -1249,6 +1449,7 @@ extension PlayerController {
             let uptimeMs = Int(ProcessInfo.processInfo.systemUptime * 1000)
             Log.player.info("AUDIO_SESSION_ACTIVATION reason=\(reason) result=success ms=\(ms) uptimeMs=\(uptimeMs)")
             traceRecovery("activation.success.\(reason)")
+            return true
         } catch {
             let ms = Int((ProcessInfo.processInfo.systemUptime - start) * 1000)
             let code = (error as NSError).code
@@ -1256,7 +1457,87 @@ extension PlayerController {
             Log.player.error("AUDIO_SESSION_ACTIVATION reason=\(reason) result=failed stage=\(stage) code=\(code) ms=\(ms) uptimeMs=\(uptimeMs)")
             traceRecovery("activation.failed.\(reason)")
             Log.player.error("Failed to assert audio session: \(error)")
+            return false
         }
+    }
+
+    /// Legacy interruption .ended is not always delivered after another app
+    /// has relinquished audio. This method is called ONLY by direct user
+    /// actions (Play button or explicitly selected new track).
+    /// Session activation must actually succeed before state is cleared.
+    private func attemptExplicitInterruptionActivation(reason: String) -> Bool {
+        guard apoloAudioInterruptionActive else { return false }
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        let outputIsBuiltIn = outputs.isEmpty || outputs.allSatisfy {
+            $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver
+        }
+        let routePermitValid = unplugManualPlayPermit?.permitsExplicitPlay(
+            playbackID: NowPlaying.shared.videoId,
+            playbackGeneration: NowPlaying.shared.playbackGeneration,
+            routeGeneration: routeChangeGeneration,
+            isUserCommand: true,
+            outputIsBuiltIn: outputIsBuiltIn
+        ) ?? false
+        let routeChanged = interruptionRouteGeneration.map {
+            $0 != routeChangeGeneration
+        } ?? true
+        let foregroundPermitValid =
+            ForegroundInterruptionRecoveryPolicy.mayAttemptActivation(
+                isInterrupted: apoloAudioInterruptionActive,
+                isExplicitUserIntent: true,
+                isAppForegroundActive: UIApplication.shared.applicationState == .active,
+                hasCurrentSelection: NowPlaying.shared.videoId != nil,
+                routeChangedSinceInterruption: routeChanged
+            )
+        guard routePermitValid || foregroundPermitValid else {
+            traceRecovery("explicitRecoveryBlocked.routeOrForeground")
+            return false
+        }
+        let activationReason = routePermitValid ? "explicitPlayAfterUnplug" : reason
+        guard assertAudioSession(reason: activationReason) else {
+            // iOS still denies the session. Remain paused; do not fake Play.
+            traceRecovery("explicitRecovery.activationDenied")
+            return false
+        }
+        apoloAudioInterruptionActive = false
+        interruptionRouteGeneration = nil
+        explicitRecoverySelection = nil
+        apoloLastInterruptionEndedAt = Date()
+        recoveryEnd = ProcessInfo.processInfo.systemUptime
+        recoveryPositionAtEnd = apoloIsActive ? apoloBackend?.currentTime : nil
+        wasPlayingBeforeInterruption = false
+        interruptedPlaybackIdentity = nil
+        pendingAudioSessionResume = nil
+        unplugManualPlayPermit = nil
+        headsetHandoffIntent = nil
+        traceRecovery("explicitRecovery.activationGranted")
+        Log.player.info(
+            "AUDIO_RECOVERY explicitPlay activation=success routePermit=\(routePermitValid) builtIn=\(outputIsBuiltIn)"
+        )
+        return true
+    }
+
+    private func retryDeferredAudioSessionResume(reason: String) {
+        guard let pending = pendingAudioSessionResume else { return }
+        // Another interruption can arrive before UIApplication becomes active.
+        // Preserve the pending intent rather than dropping it.
+        guard !apoloAudioInterruptionActive else { return }
+        let shouldRetry = AudioSessionResumePolicy.shouldRetry(
+            pendingVideoId: pending.id,
+            pendingGeneration: pending.generation,
+            currentVideoId: NowPlaying.shared.videoId,
+            currentGeneration: NowPlaying.shared.playbackGeneration,
+            desiredPlaying: wantsPlayback,
+            interruptionActive: apoloAudioInterruptionActive,
+            explicitlyPaused: isExplicitlyPausedForCurrentSelection
+        )
+        guard shouldRetry else {
+            pendingAudioSessionResume = nil
+            traceRecovery("deferredResumeDropped")
+            return
+        }
+        traceRecovery("deferredResumeRetry.\(reason)")
+        setPaused(false, forceBackendCommand: true, systemRecovery: true)
     }
 
     private func observeInterruptions() {
@@ -1291,22 +1572,34 @@ extension PlayerController {
             recoveryAdvanced = false
             recoveryObservedState = nil
             apoloAudioInterruptionActive = true
+            interruptionRouteGeneration = routeChangeGeneration
+            explicitRecoverySelection = nil
+            pendingAudioSessionResume = nil
+            interruptedPlaybackIdentity = (
+                id: NowPlaying.shared.videoId,
+                generation: NowPlaying.shared.playbackGeneration
+            )
             traceRecovery("legacyBegan")
             let wasSuspended = (userInfo[AVAudioSessionInterruptionWasSuspendedKey] as? Bool) ?? false
             Log.player.info("AUDIO_RECOVERY_LEGACY wasSuspended=\(wasSuspended) uptimeMs=\(Int(ProcessInfo.processInfo.systemUptime * 1000))")
             Log.player.info("AUDIO_INTERRUPTION began")
             wasPlayingBeforeInterruption = sharedState.withLock({ $0.desiredPlaying }) || playState.value == .playing
             if playState.value == .playing {
+                let currentRecoveryID = recoveryID
                 Task { @MainActor in
-                    self.setPaused(true)
+                    guard self.apoloAudioInterruptionActive,
+                          self.recoveryID == currentRecoveryID else { return }
+                    self.setPaused(true, systemRecovery: true)
                     self.sharedState.withLock { $0.desiredPlaying = self.wasPlayingBeforeInterruption }
                 }
             }
         case .ended:
             let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
             let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
-            let shouldResume = options.contains(.shouldResume) || wasPlayingBeforeInterruption
+            let systemAllowsResume = options.contains(.shouldResume) || wasPlayingBeforeInterruption
             apoloAudioInterruptionActive = false
+            interruptionRouteGeneration = nil
+            explicitRecoverySelection = nil
             apoloLastInterruptionEndedAt = Date()
             if recoveryBegin == nil {
                 recoveryID &+= 1
@@ -1314,19 +1607,41 @@ extension PlayerController {
             }
             recoveryEnd = ProcessInfo.processInfo.systemUptime
             recoveryPositionAtEnd = apoloIsActive ? apoloBackend?.currentTime : nil
-            traceRecovery("legacyEnded.shouldResume=\(shouldResume)")
+            traceRecovery("legacyEnded.systemAllowsResume=\(systemAllowsResume)")
             Log.player.info("AUDIO_INTERRUPTION ended")
+            let interruptedIdentity = interruptedPlaybackIdentity
             Task { @MainActor in
-                guard shouldResume else {
-                    self.traceRecovery("resumeNotRequested")
+                guard let interruptedIdentity,
+                      interruptedIdentity.id == NowPlaying.shared.videoId,
+                      interruptedIdentity.generation == NowPlaying.shared.playbackGeneration
+                else {
+                    self.traceRecovery("resumeDroppedChangedPlayback")
+                    return
+                }
+                let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+                let outputIsBuiltIn = outputs.isEmpty || outputs.allSatisfy {
+                    $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver
+                }
+                let handoffAllowed = self.headsetHandoffIntent?.permitsResume(
+                    playbackID: NowPlaying.shared.videoId,
+                    playbackGeneration: NowPlaying.shared.playbackGeneration,
+                    outputIsBuiltIn: outputIsBuiltIn,
+                    isInterrupted: self.apoloAudioInterruptionActive
+                ) ?? false
+                let userWantsPlaying = self.sharedState.withLock { $0.desiredPlaying }
+                let autoResumeAllowed = userWantsPlaying && systemAllowsResume
+                    && (self.headsetHandoffIntent == nil || handoffAllowed)
+                guard handoffAllowed || autoResumeAllowed else {
+                    self.traceRecovery("resumeBlocked.userOrSpeakerOrIdentity")
+                    self.wasPlayingBeforeInterruption = false
                     return
                 }
                 self.traceRecovery("resumeTask")
-                self.assertAudioSession(reason: "legacyInterruptionEnded")
-                if self.playState.value != .playing {
-                    self.setPaused(false)
-                }
+                // setPaused() activates the session and defers the resume if
+                // iOS still refuses it. Do not activate twice or fake Play.
+                self.headsetHandoffIntent = nil
                 self.wasPlayingBeforeInterruption = false
+                self.setPaused(false, forceBackendCommand: true, systemRecovery: true)
             }
         @unknown default:
             break
@@ -1359,8 +1674,100 @@ extension PlayerController {
               let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else { return }
 
         Log.player.info("ROUTE_CHANGE reason=\(reason.rawValue)")
-        if reason == .oldDeviceUnavailable, playState.value == .playing {
-            Task { @MainActor in togglePlayPause() }
+        let event: AudioRouteChangePolicy.Event
+        switch reason {
+        case .newDeviceAvailable:
+            event = .newDeviceAvailable
+        case .oldDeviceUnavailable:
+            event = .oldDeviceUnavailable
+        default:
+            return
+        }
+
+        routeChangeGeneration &+= 1
+        let routeGeneration = routeChangeGeneration
+        if case .newDeviceAvailable = event {
+            // AirPods left outside the case may reconnect while the legacy
+            // interruption flag is still set. Carry the existing manual
+            // permit to the NEW route generation, requiring an external
+            // output on the next explicit user Play. Do not auto-resume.
+            unplugManualPlayPermit = unplugManualPlayPermit?
+                .transferredToExternalRoute(generation: routeGeneration)
+        }
+        let commandGeneration = playbackCommandGeneration
+        let requestSerial = playRequestSerial
+        let selectedID = NowPlaying.shared.videoId
+        if case .oldDeviceUnavailable = event, let selectedID {
+            // Record before the 350ms route-settling delay: iOS can deliver
+            // interruption.began and the user can press Play during that gap.
+            // The permit alone never plays audio. Every use rechecks output,
+            // route generation, track identity and user initiation.
+            unplugManualPlayPermit = HeadphoneUnplugManualPlayPermit(
+                playbackID: selectedID,
+                playbackGeneration: NowPlaying.shared.playbackGeneration,
+                routeGeneration: routeGeneration,
+                expectsBuiltInOutput: true
+            )
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if case .oldDeviceUnavailable = event {
+                // A headset-to-headset handoff can briefly report the old
+                // output disappearing before the new Bluetooth route settles.
+                // Do not turn that transient gap into a user-requested pause.
+                do { try await Task.sleep(for: .milliseconds(350)) }
+                catch { return }
+            }
+            let sameRequest = self.routeChangeGeneration == routeGeneration
+                && self.playbackCommandGeneration == commandGeneration
+                && self.playRequestSerial == requestSerial
+                && NowPlaying.shared.videoId == selectedID
+            let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+            let builtInOutput = outputs.isEmpty || outputs.allSatisfy {
+                $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver
+            }
+            let desired = self.sharedState.withLock { $0.desiredPlaying }
+            if case .oldDeviceUnavailable = event,
+               sameRequest, builtInOutput, let selectedID,
+               desired || self.wasPlayingBeforeInterruption {
+                // Preserve short-term intent ONLY for an external replacement.
+                // Never auto-resume through the built-in iPhone speaker.
+                self.headsetHandoffIntent = AudioRouteHandoffIntent(
+                    playbackID: selectedID,
+                    playbackGeneration: NowPlaying.shared.playbackGeneration,
+                    expiresAt: Date().addingTimeInterval(15)
+                )
+                if self.apoloAudioInterruptionActive {
+                    self.sharedState.withLock { $0.desiredPlaying = false }
+                }
+            }
+            let handoffAllowed = self.headsetHandoffIntent?.permitsResume(
+                playbackID: NowPlaying.shared.videoId,
+                playbackGeneration: NowPlaying.shared.playbackGeneration,
+                outputIsBuiltIn: builtInOutput,
+                isInterrupted: self.apoloAudioInterruptionActive
+            ) ?? false
+            let action = AudioRouteChangePolicy.action(
+                for: event,
+                desiredPlaying: desired || handoffAllowed,
+                isInterrupted: self.apoloAudioInterruptionActive,
+                isCurrentRequest: sameRequest,
+                outputIsBuiltIn: builtInOutput
+            )
+            switch action {
+            case .pause:
+                // This is a privacy pause, not an explicit user Pause.
+                self.setPaused(true, systemRecovery: true)
+            case .resume:
+                self.unplugManualPlayPermit = nil
+                self.headsetHandoffIntent = nil
+                self.setPaused(false, forceBackendCommand: true, systemRecovery: true)
+            case .ignore:
+                break
+            }
+            Log.player.info(
+                "ROUTE_RECOVERY reason=\(reason.rawValue) action=\(String(describing: action)) builtIn=\(builtInOutput) current=\(sameRequest)"
+            )
         }
     }
 }
@@ -1382,6 +1789,7 @@ extension PlayerController {
     func setNowPlayingMetadata() {
         assertAudioSession(reason: "metadata")
         let np = NowPlaying.shared
+        let isLiveRadio = np.playbackKind == .radio
         nowPlayingInfo.removeAll()
 
         let liveDur: Double = apoloIsActive
@@ -1392,7 +1800,7 @@ extension PlayerController {
                 return val
             } ?? 0)
         let duration = liveDur > 0 ? liveDur : np.duration
-        if duration > 0 { np.duration = duration }
+        if !isLiveRadio, duration > 0 { np.duration = duration }
 
         let livePos: Double = apoloIsActive
             ? (apoloBackend?.currentTime ?? 0)
@@ -1409,8 +1817,14 @@ extension PlayerController {
         nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = np.isPlaying ? 1 : 0
         nowPlayingInfo[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
         nowPlayingInfo[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1
-        if duration > 0 { nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = duration }
-        nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsed
+        // Tell iOS this is a true non-seekable live broadcast rather than a
+        // zero-length file. Never publish fake elapsed/duration values for radio.
+        nowPlayingInfo[MPNowPlayingInfoPropertyIsLiveStream] = NSNumber(value: isLiveRadio)
+        if !isLiveRadio {
+            if duration > 0 { nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = duration }
+            nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsed
+        }
+        MPRemoteCommandCenter.shared().changePlaybackPositionCommand.isEnabled = !isLiveRadio
         nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackQueueIndex] = np.queueIndex
         nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackQueueCount] = np.queueSongs.count
         if let image = np.thumbnailUIImage {
@@ -1434,8 +1848,24 @@ extension PlayerController {
     }
 
     func updateNowPlayingProgress() {
+        let np = NowPlaying.shared
+        if np.playbackKind == .radio {
+            // Keep the live marker even across pause, audio route changes and
+            // periodic progress refreshes. Fake 0:00 makes iOS show --:--.
+            var info = nowPlayingInfo
+            info[MPNowPlayingInfoPropertyIsLiveStream] = NSNumber(value: true)
+            info.removeValue(forKey: MPMediaItemPropertyPlaybackDuration)
+            info.removeValue(forKey: MPNowPlayingInfoPropertyElapsedPlaybackTime)
+            info.removeValue(forKey: MPNowPlayingInfoPropertyPlaybackProgress)
+            info[MPNowPlayingInfoPropertyPlaybackRate] = np.isPlaying ? 1 : 0
+            nowPlayingInfo = info
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+            MPNowPlayingInfoCenter.default().playbackState =
+                np.isPlaying ? .playing : .paused
+            return
+        }
         let props: (dur: Double, pos: Double)? = apoloIsActive
-            ? (max(apoloBackend?.duration ?? 0, NowPlaying.shared.duration),
+            ? (max(apoloBackend?.duration ?? 0, np.duration),
                apoloBackend?.currentTime ?? 0)
             : withMpv { mpv in
                 var dur = Double(0)
@@ -1445,20 +1875,6 @@ extension PlayerController {
                 return (dur, pos)
             }
         guard var props else { return }
-        let np = NowPlaying.shared
-        if np.playbackKind == .radio {
-            // Live radio has no finite duration, but pause/lock-screen rate
-            // still needs publishing even when progress cannot be displayed.
-            var info = nowPlayingInfo
-            info.removeValue(forKey: MPMediaItemPropertyPlaybackDuration)
-            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = 0
-            info[MPNowPlayingInfoPropertyPlaybackRate] = np.isPlaying ? 1 : 0
-            nowPlayingInfo = info
-            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
-            MPNowPlayingInfoCenter.default().playbackState =
-                np.isPlaying ? .playing : .paused
-            return
-        }
         guard props.dur > 0 else { return }
 
         if let seek = pendingSeek {
@@ -1596,7 +2012,11 @@ extension PlayerController {
             object: nil, queue: .main
         ) { [weak self] _ in
             Log.player.info("AUDIO_RECOVERY_APP didBecomeActive uptimeMs=\(Int(ProcessInfo.processInfo.systemUptime * 1000))")
-            Task { @MainActor [weak self] in self?.traceRecovery("appActive") }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.traceRecovery("appActive")
+                self.retryDeferredAudioSessionResume(reason: "didBecomeActive")
+            }
         }
     }
 }
@@ -1678,7 +2098,8 @@ extension PlayerController {
         sharedState.withLock {
             $0.currentVideoId = videoId
             $0.pendingVideoId = nil
-            $0.desiredPlaying = true
+            // Do not overwrite a user Pause received while the stream
+            // was resolving or during AVFoundation load.
         }
         // Stop mpv before Apolo starts; an EOF emitted by the old mpv item
         // must never advance Thrum's queue while Apolo owns playback.
@@ -1767,9 +2188,22 @@ extension PlayerController {
                 await backend.seek(to: startAt)
             }
             guard apoloIsActive, apoloGeneration == generation else { return }
-            backend.play()
-            playState.send(.playing)
-            NowPlaying.shared.isPlaying = true
+            let canStartAudio = !apoloAudioInterruptionActive
+                && sharedState.withLock { $0.desiredPlaying }
+            if canStartAudio {
+                backend.play()
+            } else {
+                // The new recording may finish loading while iOS is still
+                // interrupted. Keep it paused for the guarded resume event.
+                backend.pause()
+                if apoloAudioInterruptionActive {
+                    interruptedPlaybackIdentity = (
+                        id: videoId, generation: NowPlaying.shared.playbackGeneration
+                    )
+                }
+            }
+            playState.send(canStartAudio ? .playing : .paused)
+            NowPlaying.shared.isPlaying = canStartAudio
             NowPlaying.shared.currentTime = isLiveRadio ? 0 : startAt
             NowPlaying.shared.duration = isLiveRadio ? 0 : max(0, duration ?? 0)
             setNowPlayingMetadata()
@@ -1829,6 +2263,7 @@ extension PlayerController {
             guard let self else { return }
             let begun = Date()
             var loggedPlaying = false
+            var firstObservedPlayingAt: Date?
             var liveRadioWatchdog = ApoloLiveRadioWatchdog()
             var finiteAudioWatchdog = ApoloFiniteAudioWatchdog()
             while !Task.isCancelled {
@@ -1864,6 +2299,24 @@ extension PlayerController {
                 }
                 switch backend.state {
                 case .finished:
+                    let decoderPosition = backend.currentTime
+                    let mediaDuration = backend.duration
+                    let publishedDuration = NowPlaying.shared.duration
+                    let early = PlaybackEndEvidence.isMateriallyEarly(
+                        decoderPosition: decoderPosition,
+                        expectedDuration: mediaDuration > 0 ? mediaDuration : publishedDuration
+                    )
+                    let elapsedPlaying = firstObservedPlayingAt.map {
+                        String(format: "%.3f", Date().timeIntervalSince($0))
+                    } ?? "unconfirmed"
+                    Log.player.warning(
+                        "APOLO_BETA finished videoId=\(videoId ?? "nil") gen=\(generation) "
+                            + "decoderPosition=\(String(format: "%.3f", decoderPosition)) "
+                            + "mediaDuration=\(String(format: "%.3f", mediaDuration)) "
+                            + "publishedDuration=\(String(format: "%.3f", publishedDuration)) "
+                            + "elapsedPlaying=\(elapsedPlaying) early=\(early) "
+                            + "desired=\(self.wantsPlayback)"
+                    )
                     if isLiveRadio {
                         // A live station ending is a stream error, not an EOF
                         // that advances the user's music queue.
@@ -1913,7 +2366,10 @@ extension PlayerController {
                         }
                     } else if finiteAudioWatchdog.hasTimedOut(
                         now: Date(),
-                        isInterrupted: self.apoloAudioInterruptionActive,
+                        isInterrupted: PlaybackPausePolicy.watchdogIsSuspended(
+                            desiredPlaying: self.wantsPlayback,
+                            audioInterruptionActive: self.apoloAudioInterruptionActive
+                        ),
                         interruptionEndedAt: self.apoloLastInterruptionEndedAt
                     ) {
                         Log.player.warning("APOLO_BETA recovery loading timeout; using mpv fallback")
@@ -1930,12 +2386,17 @@ extension PlayerController {
                     }
                     if !loggedPlaying {
                         loggedPlaying = true
+                        firstObservedPlayingAt = Date()
                         self.traceRecovery("apoloPlaying")
                         Log.player.info(
-                            "APOLO_BETA firstPlaying videoId=\(videoId ?? "nil") ms=\(Self.msSince(begun))"
+                            "APOLO_BETA firstPlaying videoId=\(videoId ?? "nil") "
+                                + "ms=\(Self.msSince(begun)) "
+                                + "decoderPosition=\(String(format: "%.3f", backend.currentTime)) "
+                                + "mediaDuration=\(String(format: "%.3f", backend.duration))"
                         )
                     }
-                    if self.playState.value != .playing {
+                    if self.playState.value != .playing,
+                       !self.isAudioSessionResumePendingForCurrentSelection {
                         self.playState.send(.playing)
                         NowPlaying.shared.isPlaying = true
                     }
@@ -1963,7 +2424,10 @@ extension PlayerController {
                         )
                         : finiteAudioWatchdog.hasTimedOut(
                             now: Date(),
-                            isInterrupted: self.apoloAudioInterruptionActive,
+                            isInterrupted: PlaybackPausePolicy.watchdogIsSuspended(
+                                desiredPlaying: self.wantsPlayback,
+                                audioInterruptionActive: self.apoloAudioInterruptionActive
+                            ),
                             interruptionEndedAt: self.apoloLastInterruptionEndedAt
                         )
                     if idleTimedOut {
@@ -1994,6 +2458,9 @@ extension PlayerController {
         }
         let position = isLiveRadio ? 0 : currentTime
         traceRecovery("mpvFallback")
+        Log.player.info(
+            "PLAYBACK_INTENT fallback preserving desired=\(wantsPlayback) pausedGen=\(explicitlyPausedSelectionGeneration ?? -1)"
+        )
         if !isLiveRadio {
             NowPlaying.shared.rememberInterruptedPlayback(position, for: videoId)
         }

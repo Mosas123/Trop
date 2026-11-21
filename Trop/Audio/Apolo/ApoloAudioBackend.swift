@@ -13,6 +13,15 @@ final class ApoloAudioBackend {
         managesAudioSession: false
     )
 
+    init() {
+        // Apolo emits numeric telemetry only: no source URL or HTTP headers.
+        // The existing serialized file logger makes these metrics available
+        // in the iPhone Files app without any Mac/Xcode connection.
+        engine.setDiagnosticHandler { event in
+            Log.player.info("APOLO_DIAG \(event)")
+        }
+    }
+
     var state: PlaybackState { engine.state }
     var currentTime: TimeInterval { engine.currentTime }
     var duration: TimeInterval { engine.duration }
