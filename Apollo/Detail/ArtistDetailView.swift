@@ -426,7 +426,7 @@ struct ArtistDetailView: View {
             Spacer(minLength: 0)
 
             if let artist = viewModel.artist,
-               let url = URL(string: "https://music.youtube.com/channel/\(artist.browseId)") {
+               let url = SpotifyCatalogID.shareURL(for: artist.browseId) ?? URL(string: "https://music.youtube.com/channel/\(artist.browseId)") {
                 HStack(spacing: 0) {
                     ShareLink(item: url) {
                         Image(systemName: "square.and.arrow.up")
@@ -456,7 +456,7 @@ struct ArtistDetailView: View {
     private var topBarMenuButton: some View {
         Menu {
             if let artist = viewModel.artist,
-               let url = URL(string: "https://music.youtube.com/channel/\(artist.browseId)") {
+               let url = SpotifyCatalogID.shareURL(for: artist.browseId) ?? URL(string: "https://music.youtube.com/channel/\(artist.browseId)") {
                 ShareLink(item: url) {
                     Label("Share", systemImage: "square.and.arrow.up")
                 }
@@ -493,7 +493,7 @@ struct ArtistDetailView: View {
 
     private func copyArtistLink() {
         guard let artist = viewModel.artist,
-              let url = URL(string: "https://music.youtube.com/channel/\(artist.browseId)") else { return }
+              let url = SpotifyCatalogID.shareURL(for: artist.browseId) ?? URL(string: "https://music.youtube.com/channel/\(artist.browseId)") else { return }
         UIPasteboard.general.string = url.absoluteString
         linkCopied = true
         linkResetTask?.cancel()

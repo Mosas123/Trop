@@ -27,8 +27,8 @@ tests de CI y una IPA; no se marca como hecha sin probarla en dispositivo.
 ## P2 — catálogo y metadatos
 
 - [x] Normalización Unicode (CJK/árabe/cirílico) sin colisiones.
-- [ ] Filtro explícito en Search/álbum/playlist/Library, no solo Home.
-- [ ] Compartir canciones Spotify con enlace correcto.
+- [~] Filtro explícito en Search/álbum/playlist/artista; falta Library local.
+- [x] Compartir canciones/álbumes/artistas/podcasts usa open.spotify.com cuando el ID es Spotify.
 - [ ] Playlist: parsear todas las formas de imagen y paginación completa.
 - [ ] Artwork: portadas de playlist y fuentes sin imagen 1200 (mosaico/placeholder consistente).
 - [ ] Podcast: bio/feed y artwork con una sola identidad de show.

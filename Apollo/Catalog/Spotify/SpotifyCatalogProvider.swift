@@ -14,7 +14,10 @@ struct SpotifyCatalogProvider: CatalogSearching {
 
     func search(_ query: String, limit: Int = 20) async throws -> CatalogSearchResults {
         let data = try await client.search(query: query, limit: limit)
-        let results = try Self.parseSearch(data, limit: limit)
+        var results = try Self.parseSearch(data, limit: limit)
+        if ExplicitContentPolicy.hidesExplicit {
+            results.tracks.removeAll { $0.isExplicit }
+        }
         let tracks = Array(results.tracks.prefix(6))
         if !tracks.isEmpty {
             Task { await CatalogEnrichmentWorker.shared.enqueue(tracks) }

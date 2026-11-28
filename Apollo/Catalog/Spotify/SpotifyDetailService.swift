@@ -30,6 +30,9 @@ final class SpotifyDetailService {
                 detail.songs[index].artists = detail.artists
             }
         }
+        if ExplicitContentPolicy.hidesExplicit {
+            detail.songs.removeAll { $0.isExplicit }
+        }
 
         // Apple/iTunes fills missing fields and upgrades a low-resolution
         // Spotify cover without changing artists or identifiers.
@@ -167,17 +170,20 @@ final class SpotifyDetailService {
             )
         }
 
+        let visibleSongs = ExplicitContentPolicy.hidesExplicit
+            ? songs.filter { !$0.isExplicit }
+            : songs
         return PlaylistDetailInfo(
             title: title,
             authorName: ownerName,
             authorBrowseId: nil,
             authorAvatarUrl: ownerAvatar,
             descriptionText: (playlist["description"] as? String).flatMap { $0.isEmpty ? nil : $0 },
-            songCount: max(totalCount, songs.count),
-            duration: songs.reduce(0) { $0 + $1.duration },
+            songCount: max(totalCount, visibleSongs.count),
+            duration: visibleSongs.reduce(0) { $0 + $1.duration },
             thumbnailUrl: cover,
             playlistId: SpotifyCatalogID.playlist(id),
-            songs: songs
+            songs: visibleSongs
         )
     }
 
@@ -255,6 +261,9 @@ final class SpotifyDetailService {
             ? "\(Self.compactCount(monthly)) monthly listeners"
             : (followers > 0 ? "\(Self.compactCount(followers)) followers" : nil)
 
+        let visibleSongs = ExplicitContentPolicy.hidesExplicit
+            ? songs.filter { !$0.isExplicit }
+            : songs
         return ArtistDetailInfo(
             name: name,
             thumbnailUrl: avatar,
@@ -262,7 +271,7 @@ final class SpotifyDetailService {
             descriptionText: bio,
             isSubscribed: false,
             browseId: SpotifyCatalogID.artist(id),
-            songs: songs,
+            songs: visibleSongs,
             albums: albums,
             singles: singles,
             videos: [],

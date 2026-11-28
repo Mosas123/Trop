@@ -580,7 +580,10 @@ struct EpisodeItem {
 
 extension SongItem {
     var webUrl: String {
-        "https://music.youtube.com/watch?v=\(videoId)"
+        if let spotify = SpotifyCatalogID.shareURL(for: videoId) {
+            return spotify.absoluteString
+        }
+        return "https://music.youtube.com/watch?v=\(videoId)"
     }
 
     var artistNamesDisplay: String {
@@ -602,7 +605,10 @@ extension SongItem {
 
 extension EpisodeItem {
     var webUrl: String {
-        "https://music.youtube.com/watch?v=\(videoId)"
+        if let spotify = SpotifyCatalogID.shareURL(for: videoId) {
+            return spotify.absoluteString
+        }
+        return "https://music.youtube.com/watch?v=\(videoId)"
     }
 }
 
@@ -619,11 +625,20 @@ extension YTItem {
         case .song(let s): return s.webUrl
         case .episode(let e): return e.webUrl
         case .album(let a):
+            if let spotify = SpotifyCatalogID.shareURL(for: a.browseId) {
+                return spotify.absoluteString
+            }
             guard let pid = a.playlistId else { return nil }
             return "https://music.youtube.com/playlist?list=\(pid)"
         case .artist(let a):
+            if let spotify = SpotifyCatalogID.shareURL(for: a.browseId) {
+                return spotify.absoluteString
+            }
             return "https://music.youtube.com/channel/\(a.browseId)"
         case .playlist(let p):
+            if let spotify = SpotifyCatalogID.shareURL(for: p.id) {
+                return spotify.absoluteString
+            }
             return "https://music.youtube.com/playlist?list=\(p.id)"
         case .podcast:
             return nil

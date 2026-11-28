@@ -766,7 +766,7 @@ struct PodcastMoreSheet: View {
     }
 
     private func share() {
-        guard let url = URL(string: "https://music.youtube.com/browse/\(podcast.browseId)") else { return }
+        guard let url = SpotifyCatalogID.shareURL(for: podcast.browseId) ?? URL(string: "https://music.youtube.com/browse/\(podcast.browseId)") else { return }
         presentShareSheet(items: [url])
         dismiss()
     }
