@@ -778,8 +778,12 @@ extension DownloadManager {
                 throw MusicCatalogError.unavailableTrack
             }
             let client = try MusicAddonClient(installation: installation)
+            let downloadTier = SettingsStore.shared.downloadQuality
             let quality: AddonStreamQuality
-            if preference?.requireCD == true {
+            if !allowLossless || downloadTier == .high || downloadTier == .standard {
+                // The download setting is a ceiling, not a suggestion.
+                quality = .high
+            } else if preference?.requireCD == true {
                 quality = .lossless
             } else {
                 quality = (preference?.preferHiRes ?? false) ? .hires : .lossless

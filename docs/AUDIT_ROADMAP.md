@@ -22,7 +22,7 @@ tests de CI y una IPA; no se marca como hecha sin probarla en dispositivo.
 - [x] `SponsorBlockIntegration`: resetea `skipped` al repetir o rebobinar.
 - [x] Podcast: `bestEpisode` con tolerancia 120 s y desempate por duración.
 - [x] Descargas: `failedAddonKey` se asigna; el reintento en otro addon ya es alcanzable.
-- [~] Addons: host con punto final y streams no HTTP/credenciales rechazados; falta calidad en descarga directa, IP privadas y tamaño de respuesta.
+- [~] Addons: host con punto final y streams no HTTP/credenciales rechazados; descarga directa respeta downloadQuality; falta IP privadas y tamaño de respuesta.
 
 ## P2 — catálogo y metadatos
 
