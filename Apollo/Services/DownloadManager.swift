@@ -489,6 +489,10 @@ extension DownloadManager {
             } else {
                 source = try await downloadSource(for: song, allowLossless: allowLosslessSource)
             }
+            // This is what makes the existing retry path reachable. It was
+            // declared but never assigned, so a failed add-on never cooled
+            // down or retried on another installation.
+            failedAddonKey = source.addonKey
             let knownBytes: Int64?
             if let known = source.knownSizeBytes {
                 knownBytes = Int64(known)

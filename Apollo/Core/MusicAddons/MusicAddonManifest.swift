@@ -353,6 +353,7 @@ struct MusicAddonPackage: Sendable {
         let host = rawHost.lowercased()
         let disallowedSuffixes = [".local", ".localhost", ".internal", ".invalid", ".test"]
         guard host.contains("."), host != "localhost", host != "127.0.0.1",
+              !host.hasSuffix("."),
               !disallowedSuffixes.contains(where: host.hasSuffix),
               !host.contains(":"),
               !host.split(separator: ".").allSatisfy({ $0.allSatisfy(\.isNumber) }),

@@ -21,8 +21,8 @@ tests de CI y una IPA; no se marca como hecha sin probarla en dispositivo.
 - [ ] Evitar doble conteo en upgrade en caliente / Apolo→mpv.
 - [x] `SponsorBlockIntegration`: resetea `skipped` al repetir o rebobinar.
 - [x] Podcast: `bestEpisode` con tolerancia 120 s y desempate por duración.
-- [ ] Descargas: `failedAddonKey` real, reintento y fallback.
-- [ ] Addons: calidad en descarga directa, esquemas HTTPS, bloquear loopback/IP privadas y respuestas gigantes.
+- [x] Descargas: `failedAddonKey` se asigna; el reintento en otro addon ya es alcanzable.
+- [~] Addons: host con punto final y streams no HTTP/credenciales rechazados; falta calidad en descarga directa, IP privadas y tamaño de respuesta.
 
 ## P2 — catálogo y metadatos
 

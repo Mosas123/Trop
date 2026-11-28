@@ -489,7 +489,10 @@ actor MusicAddonClient {
               let object = try? JSONSerialization.jsonObject(with: data),
               let root = object as? [String: Any],
               let raw = root["url"] as? String,
-              let streamURL = URL(string: raw) else {
+              let streamURL = URL(string: raw),
+              let scheme = streamURL.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              streamURL.user == nil, streamURL.password == nil else {
             throw MusicAddonClientError.noStream
         }
         let format = ((root["format"] as? String) ?? (root["codec"] as? String) ?? "")
