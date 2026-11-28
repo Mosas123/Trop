@@ -15,9 +15,17 @@ enum TextMatch {
 
     /// Lowercase, diacritic-insensitive, punctuation-light key.
     static func normalize(_ value: String) -> String {
-        value
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            .replacingOccurrences(of: "[^a-z0-9 ]", with: " ", options: .regularExpression)
+        let folded = value.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: .current
+        )
+        // Keep Unicode letters and digits. Dropping everything non-ASCII made
+        // CJK/Arabic/Cyrillic titles normalize to "" and match any candidate.
+        let allowed = CharacterSet.alphanumerics
+        let scalars = folded.unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(scalar) : " "
+        }
+        return String(scalars)
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespaces)
             .lowercased()

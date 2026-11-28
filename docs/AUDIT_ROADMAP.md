@@ -15,18 +15,18 @@ tests de CI y una IPA; no se marca como hecha sin probarla en dispositivo.
 
 ## P1 — playback y datos
 
-- [ ] Carrera RSS/YouTube: no esperar al perdedor; no cachear cancelaciones.
+- [x] Carrera RSS/YouTube: primer carrier gana sin esperar al perdedor (race no estructurada).
 - [x] `startRadio` no pisa una cola si cambia la generación.
 - [x] `disableShuffle` restaura por catalogID o videoId.
 - [ ] Evitar doble conteo en upgrade en caliente / Apolo→mpv.
-- [ ] `SponsorBlockIntegration`: resetear `skipped` al repetir videoId.
-- [ ] Podcast: `bestEpisode` con desempate y tolerancia de duración estricta.
+- [x] `SponsorBlockIntegration`: resetea `skipped` al repetir o rebobinar.
+- [x] Podcast: `bestEpisode` con tolerancia 120 s y desempate por duración.
 - [ ] Descargas: `failedAddonKey` real, reintento y fallback.
 - [ ] Addons: calidad en descarga directa, esquemas HTTPS, bloquear loopback/IP privadas y respuestas gigantes.
 
 ## P2 — catálogo y metadatos
 
-- [ ] Normalización no latina (CJK/árabe/cirílico) sin colisiones.
+- [x] Normalización Unicode (CJK/árabe/cirílico) sin colisiones.
 - [ ] Filtro explícito en Search/álbum/playlist/Library, no solo Home.
 - [ ] Compartir canciones Spotify con enlace correcto.
 - [ ] Playlist: parsear todas las formas de imagen y paginación completa.

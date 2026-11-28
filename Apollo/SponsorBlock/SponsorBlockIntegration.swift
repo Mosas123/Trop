@@ -42,6 +42,7 @@ final class SponsorBlockIntegration {
     }
 
     private var videoId: String?
+    private var lastObservedPosition: Double = 0
     private var segments: [Segment] = []
     private var skipped: Set<Int> = []
     private var prefetchedSegments: [String: [Segment]] = [:]
@@ -89,6 +90,7 @@ final class SponsorBlockIntegration {
               let id = nowPlaying.videoId else { return }
         if id != videoId {
             videoId = id
+            lastObservedPosition = 0
             segments = []
             skipped = []
             if let found = prefetchedSegments[id] {
@@ -113,6 +115,10 @@ final class SponsorBlockIntegration {
         let player = PlayerController.shared
         guard player.currentVideoId == id, player.pendingVideoId == nil else { return }
         let position = nowPlaying.currentTime
+        // Replaying the same video (or seeking back) starts a new pass over
+        // the segments; otherwise a second play silently skips nothing.
+        if position + 1 < lastObservedPosition { skipped.removeAll() }
+        lastObservedPosition = position
         let allowedCategories: Set<String> = nowPlaying.playbackKind == .podcast
             ? ["sponsor", "selfpromo"]
             : ["music_offtopic"]

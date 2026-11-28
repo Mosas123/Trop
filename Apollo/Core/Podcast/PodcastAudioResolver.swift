@@ -121,14 +121,19 @@ actor PodcastAudioResolver {
 
             if song.duration > 0, let duration = episode.duration, duration > 0 {
                 let delta = abs(duration - song.duration)
-                if delta <= 10 { score += 30 }
-                else if delta <= 45 { score += 10 }
-                else if delta > 180 { return nil }
+                if delta > 120 { return nil }
+                score += max(0, 30 - Int(delta / 4))
             }
             return (episode, score)
         }
 
-        return scored.max { $0.1 < $1.1 }?.0
+        return scored.max { lhs, rhs in
+            if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
+            // Equal titles: prefer the episode whose duration is closest.
+            let lhsDelta = abs((lhs.0.duration ?? 0) - song.duration)
+            let rhsDelta = abs((rhs.0.duration ?? 0) - song.duration)
+            return lhsDelta > rhsDelta
+        }?.0
     }
 
     private func mimeType(for url: URL) -> String {

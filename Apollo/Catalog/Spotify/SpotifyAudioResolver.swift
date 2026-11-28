@@ -46,33 +46,51 @@ final class SpotifyAudioResolver {
         case youtube(SongItem)
     }
 
-    /// RSS and YouTube race each other; the first playable carrier wins and the
-    /// losing lookup is cancelled. Failures are cached only briefly, so a
-    /// transient miss retries instead of being stuck for the whole session.
-    private func resolvePodcastEpisode(_ song: SongItem) async -> SongItem? {
-        let carrier = await withTaskGroup(of: PodcastCarrier?.self) { group -> PodcastCarrier? in
-            group.addTask {
-                if let match = await PodcastAudioResolver.shared.resolve(for: song) {
-                    return .rss(match)
-                }
-                return nil
-            }
-            group.addTask {
-                if let resolved = await PodcastYouTubeResolver.shared.resolve(for: song) {
-                    return .youtube(resolved)
-                }
-                return nil
-            }
-            var winner: PodcastCarrier?
-            while let candidate = await group.next() {
-                if candidate != nil {
-                    winner = candidate
-                    group.cancelAll()
-                    break
-                }
-            }
-            return winner
+    @MainActor
+    private final class PodcastRaceState {
+        private var continuation: CheckedContinuation<PodcastCarrier?, Never>?
+        private var remaining = 2
+
+        init(_ continuation: CheckedContinuation<PodcastCarrier?, Never>) {
+            self.continuation = continuation
         }
+
+        func finish(_ value: PodcastCarrier?) {
+            if let value {
+                finishOnce(value)
+            } else {
+                remaining -= 1
+                if remaining == 0 { finishOnce(nil) }
+            }
+        }
+
+        private func finishOnce(_ value: PodcastCarrier?) {
+            guard let continuation else { return }
+            self.continuation = nil
+            continuation.resume(returning: value)
+        }
+    }
+
+    /// This is an unstructured race on purpose: a structured task group waits
+    /// for the losing child before returning, which put the 8 s RSS timeout
+    /// back on the podcast play path. The first usable carrier wins.
+    private func firstPodcastCarrier(for song: SongItem) async -> PodcastCarrier? {
+        await withCheckedContinuation { continuation in
+            let state = PodcastRaceState(continuation)
+            Task { @MainActor in
+                let match = await PodcastAudioResolver.shared.resolve(for: song)
+                state.finish(match.map { .rss($0) })
+            }
+            Task { @MainActor in
+                let resolved = await PodcastYouTubeResolver.shared.resolve(for: song)
+                state.finish(resolved.map { .youtube($0) })
+            }
+        }
+    }
+
+    /// RSS and YouTube race each other; the first playable carrier wins.
+    private func resolvePodcastEpisode(_ song: SongItem) async -> SongItem? {
+        let carrier = await firstPodcastCarrier(for: song)
 
         switch carrier {
         case .rss(let match):
